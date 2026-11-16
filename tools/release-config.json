@@ -1,0 +1,13 @@
+{
+  "product": "OmniMovement",
+  "folder": "OmniMovement",
+  "module": "omni_precision_backend",
+  "provenance_filename": "BUILD_INFO.json",
+  "backend_version": "precision-native-stage29-velocity-guard-20261111",
+  "game_acceptance": "Targeted Windows BL2 gameplay feedback accepted; co-op and Proton/Wine remain unverified.",
+  "api_markers": [
+    "combat_snapshot",
+    "intent_observe",
+    "velocity_write"
+  ]
+}

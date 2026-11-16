@@ -1,0 +1,73 @@
+name: Bug report
+description: Report a reproducible problem with this mod.
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check the README and troubleshooting guide first. Remove usernames, personal paths, account details, and unrelated log data from attachments.
+  - type: input
+    id: versions
+    attributes:
+      label: Mod, PythonSDK, and mod-manager versions
+      placeholder: "Mod version; PythonSDK version; Willow2 version"
+    validations:
+      required: true
+  - type: dropdown
+    id: game
+    attributes:
+      label: Game
+      options:
+        - Borderlands 2
+        - Borderlands: The Pre-Sequel (unsupported by OmniMovement)
+    validations:
+      required: true
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Platform
+      options:
+        - Windows
+        - Windows build under Proton/Wine
+        - Native Linux (not currently supported)
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: role
+    attributes:
+      label: Session role
+      options:
+        - Single-player
+        - Co-op host
+        - Co-op client
+        - Not applicable
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Include relevant options and exact steps.
+      placeholder: "1. Enable...\n2. Enter...\n3. Observe..."
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or screenshots (optional)
+      description: Only include redacted, directly relevant excerpts or captures.
+    validations:
+      required: false

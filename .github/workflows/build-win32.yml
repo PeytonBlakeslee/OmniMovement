@@ -1,0 +1,150 @@
+name: OmniMovement Win32 build and package
+on:
+  push:
+    branches: [main, testing]
+    paths: ['mod/**', 'native/**', 'native_core/**', 'tests/**', 'tools/**', 'licenses/**', 'CMakeLists.txt', '.github/workflows/build-win32.yml']
+  pull_request:
+    branches: [main]
+    paths: ['mod/**', 'native/**', 'native_core/**', 'tests/**', 'tools/**', 'licenses/**', 'CMakeLists.txt', '.github/workflows/build-win32.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows-build:
+    runs-on: windows-2022
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.14'
+      - name: Frontend regressions and syntax
+        shell: pwsh
+        run: |
+          python -B -m unittest discover -s tests -p 'test_*bridge.py' -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -B -m unittest discover -s tests -p 'test_omnitps_*.py' -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -B -m unittest discover -s tests -p 'test_scorpio_assist.py' -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -B -m unittest discover -s tests -p 'test_action_skill_context.py' -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -B -m unittest discover -s tests -p 'test_native_hipfire_security.py' -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -B -m unittest discover -s tests -p 'test_salvador_pose.py' -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -B -m unittest discover -s tests -p 'test_fire_pose_alias_ownership.py' -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -B -m unittest discover -s tests -p 'test_disable_cleanup.py' -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -B -m unittest discover -s tests -p 'test_travel_input_transaction.py' -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -B -m unittest discover -s tests -p 'test_zero_execute_handoff.py' -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -B -m unittest discover -s tests -p 'test_execute_crouch_recovery.py' -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -B -m unittest discover -s tests -p 'test_duck_transition_events.py' -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -B -m unittest discover -s tests -p 'test_ads_micro_transitions.py' -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -B -m unittest discover -s tests -p 'test_pause_sprint_reticle.py' -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -B -m unittest discover -s tests -p 'test_combat_sprint_continuation.py' -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -B -m unittest discover -s tests -p 'test_sal_fire_input.py' -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -B -m unittest discover -s tests -p 'test_zero_skill_transitions.py' -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -B -m unittest discover -s tests -p 'test_zero_dash_sprint_handoff.py' -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # Player-only cleanliness must not reject optional testing diagnostics.
+          # Player branches and PR merge refs retain this release gate.
+          if ($env:GITHUB_REF_NAME -ne 'testing') {
+            python -B -m unittest discover -s tests -p 'test_player_release_clean.py' -v
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          python -B -c "import ast,pathlib; [ast.parse(p.read_text(encoding='utf-8-sig'), filename=str(p)) for p in pathlib.Path('mod/OmniMovement').glob('*.py')]"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Native Release assertions (Win32)
+        shell: pwsh
+        run: |
+          cmake -S . -B build/core -G 'Visual Studio 17 2022' -A Win32
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build/core --config Release --parallel 4
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ctest --test-dir build/core -C Release --output-on-failure
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Fetch exact SDK revisions
+        shell: pwsh
+        run: |
+          git clone --no-checkout --depth 1 https://github.com/bl-sdk/pyunrealsdk.git native/pyunrealsdk
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git -C native/pyunrealsdk fetch --depth 1 origin c72c5558473bfa1f1cbc9c9113efb2a02251e656
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git -C native/pyunrealsdk checkout --detach c72c5558473bfa1f1cbc9c9113efb2a02251e656
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git -C native/pyunrealsdk submodule update --init --recursive --depth 1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $sdkCommit = git -C native/pyunrealsdk/libs/unrealsdk rev-parse HEAD
+          if ($sdkCommit -ne 'b1852aa440277afcce8a13566b5487aeae5a7ae9') { throw 'Unexpected SDK revision' }
+      - name: Configure pinned WILLOW extension
+        shell: pwsh
+        run: |
+          $configureArgs = @(
+            '-S', 'native', '-B', 'build/native', '-G', 'Visual Studio 17 2022', '-A', 'Win32',
+            '-DUNREALSDK_FLAVOUR:STRING=WILLOW', '-DEXPLICIT_PYTHON_VERSION:STRING=3.14.3',
+            '-DEXPLICIT_PYTHON_ARCH:STRING=win32',
+            '-DEXPLICIT_PYTHON_HASH_BASE:STRING=SHA256=c8f858b042be750a2086b5e83e840a773a4b28b820854b03f42572d72e794e7f',
+            '-DEXPLICIT_PYTHON_HASH_TEST:STRING=SHA256=72b7fd7adac0249e89b5706d7460d92ae6c471525052704ca60463aa21785795',
+            '-DEXPLICIT_PYTHON_HASH_EMBEDDABLE:STRING=SHA256=2884a2fa6526b5f5db3dd53ceb9ce28bc0c73842abeba62a3e46ffd4aaecae50'
+          )
+          & cmake @configureArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Compile native backend
+        shell: pwsh
+        run: |
+          cmake --build build/native --config Release --target omni_precision_backend --parallel 4
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Audit PE and package complete mod and source
+        shell: pwsh
+        run: |
+          $nativeFiles = @(Get-ChildItem -Path build/native -Recurse -Filter omni_precision_backend.pyd)
+          if ($nativeFiles.Count -ne 1) { throw 'Expected one native extension' }
+          python -B tools/package_release.py --native $nativeFiles[0].FullName
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build private Player or Developer install ZIP from branch-matched PE
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF_NAME -eq 'release-candidate') {
+            if ($env:GITHUB_EVENT_NAME -ne 'workflow_dispatch') { throw 'Candidate builds must be manually requested' }
+            python -B tools/package_native_install.py --flavor player --private-candidate
+          } else {
+            if ($env:GITHUB_REF_NAME -eq 'main') { $flavor = 'player' }
+            elseif ($env:GITHUB_REF_NAME -eq 'testing') { $flavor = 'developer' }
+            else { throw "Unrecognized package source branch: $env:GITHUB_REF_NAME" }
+            python -B tools/package_native_install.py --flavor $flavor
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        if: github.event_name != 'pull_request'
+        with:
+          name: install-${{ github.event.repository.name }}-${{ github.sha }}
+          path: |
+            dist/*-Player-Win32.zip
+            dist/*-Developer-Win32.zip
+            dist/*.manifest.json
+            dist/*.sha256
+            dist/BUILD_INFO.json
+          if-no-files-found: error
+          retention-days: 90
+      # Runs after private artifact upload. One maintainer-accepted exact-ID race
+      # remains a visible expected failure; unexpected passes and other failures
+      # remain release-blocking.
+      - name: Hook ownership release gate (accepted SDK race monitored)
+        if: always()
+        shell: pwsh
+        run: |
+          python -B -m unittest discover -s tests -p 'test_required_sprint_hooks.py' -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

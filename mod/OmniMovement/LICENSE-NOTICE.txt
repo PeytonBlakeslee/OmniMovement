@@ -1,0 +1,21 @@
+OmniMovement project source: MIT License, Copyright (c) 2026 Peyton Blakeslee.
+See LICENSE in the repository and the license shipped with release packages.
+Third-party components retain their own terms, described in THIRD_PARTY_NOTICES.md.
+
+Third-party build dependencies:
+
+- pyunrealsdk, copyright bl-sdk contributors, LGPL-3.0.
+  Source: https://github.com/bl-sdk/pyunrealsdk
+  Revision: c72c5558473bfa1f1cbc9c9113efb2a02251e656
+- UnrealSDK, copyright bl-sdk contributors, LGPL-3.0.
+  Source: https://github.com/bl-sdk/unrealsdk
+  Revision: b1852aa440277afcce8a13566b5487aeae5a7ae9
+- pybind11, copyright Wenzel Jakob and contributors, BSD-style license.
+  Source: https://github.com/pybind/pybind11
+  Revision: f5fbe867d2d26e4a0a9177a51f6e568868ad3dc8
+
+The corresponding upstream license texts and GPL-3.0 text referenced by the
+LGPL are included under licenses/. These notices do not replace their terms.
+The mod uses the installed Python and SDK runtimes; it does not package their
+shared DLLs. Exact source revisions and reproducible build instructions are
+included in the source archive and BUILD_INFO.json.

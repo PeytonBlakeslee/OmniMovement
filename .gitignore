@@ -1,0 +1,42 @@
+# Generated build and release artifacts
+build/
+dist/
+native/pyunrealsdk/
+__pycache__/
+*.pyc
+*.pyd
+*.dll
+*.exe
+*.obj
+*.pdb
+*.sdkmod
+*.zip
+*.7z
+
+# Local configuration, credentials and private files
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+secrets.json
+settings/
+mod/*/settings/
+
+# Local profiling, logs, backups and temporary files
+*.log
+*.dmp
+*.bak
+*.tmp
+*.swp
+*.swo
+mod/*/reports/
+reports/
+.pytest_cache/
+.mypy_cache/
+.venv/
+.vs/
+.idea/
