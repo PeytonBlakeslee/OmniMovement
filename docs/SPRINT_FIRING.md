@@ -1,6 +1,6 @@
 # Sprint-firing: Player Guide
 
-Applies to **OmniMovement v1.1.17** on Windows Borderlands 2. This is pre-release documentation; there is no public Player download yet.
+Applies to **OmniMovement v1.1.17** on Windows Borderlands 2. Get the matching Player Win32 ZIP from the [Releases page](https://github.com/PeytonBlakeslee/OmniMovement/releases) when available; GitHub-generated source archives are not installable Player packages.
 
 **Contents:** [Setup](#setup) · [Sprint-firing options](#sprint-firing-options) · [Quick in-game check](#quick-in-game-check) · [Recovery and rollback](#recovery-and-rollback)
 
