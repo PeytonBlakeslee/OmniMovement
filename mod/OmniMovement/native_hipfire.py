@@ -1,9 +1,9 @@
 """Validated runtime bytecode patches for native hip-fire sprinting in BL2.
 
-The stable patch removes only the main-hand Weapon.IsFiring() exclusion from
-CanContinueSprinting. The opt-in experimental patch additionally removes the
-same exclusion from CanSprint, preserving every other native gate. Neither
-patch changes game files on disk.
+The continuation patch removes only the main-hand Weapon.IsFiring() exclusion
+from CanContinueSprinting. The optional sprint-entry patch also removes that
+exclusion from CanSprint, preserving every other native gate. Neither patch
+changes game files on disk.
 """
 from __future__ import annotations
 
@@ -93,11 +93,7 @@ def _find_target(script: bytes):
 
 
 class NativeHipFirePatch:
-    """Own a validated CanContinueSprinting hip-fire patch only.
-
-    CanSprint intentionally remains vanilla so firing cannot start a new sprint;
-    this preserves weapon/posture state and lets Sprint Assist retry after firing.
-    """
+    """Own validated sprint-fire patches, including optional sprint entry."""
 
     def __init__(self):
         self.script_array_offset = None

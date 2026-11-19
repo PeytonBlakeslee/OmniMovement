@@ -74,6 +74,7 @@ class InstalledPerformanceTests(unittest.TestCase):
                   _weapon_transition_addresses={3},
                   _weapon_transition_refs={3: lambda: old_weapon},
                   _pc=lambda: pc, _local_pawn_address=1,
+                  _schedule_offhand_crosshair=lambda *a: None,
                   _schedule_crosshair_resync=lambda *a, **kw: events.append("repair"))
         load_definitions(MOD / "__init__.py",
                          ["_same", "_is_local_pawn", "_weapon_transition_end"], ns)
@@ -103,6 +104,9 @@ class InstalledPerformanceTests(unittest.TestCase):
         widget = obj(20, MyHUDMovie=movie)
         movie.CrosshairWidget = widget
         self.assertIs(lookup(pc, retry_interval=0.05), widget)
+        replacement = obj(21, MyHUDMovie=movie)
+        movie.CrosshairWidget = replacement
+        self.assertIs(lookup(pc, retry_interval=0.05), replacement)
         self.assertEqual(scans, [10])
         pc.myHUD.HUDMovie = obj(11, CrosshairWidget=None)
         self.assertIsNone(lookup(pc, retry_interval=0.05))
@@ -114,7 +118,8 @@ class InstalledPerformanceTests(unittest.TestCase):
         repairs = []
         widget = obj(20, WWeap=obj(30), MyHUDMovie=obj(10),
                      bScopeCrosshair=False, bDualWieldCrosshair=False)
-        pc = obj(1, bInSprintState=True, WorldInfo=NS(TimeSeconds=1.0))
+        pc = obj(1, bInSprintState=True, WorldInfo=NS(TimeSeconds=1.0),
+                 myHUD=NS(HUDMovie=widget.MyHUDMovie))
 
         def set_hook(tag, enabled, path, phase, callback):
             if enabled:
@@ -133,6 +138,7 @@ class InstalledPerformanceTests(unittest.TestCase):
                   CROSSHAIR_UPDATE="Update", PLAYER_TICK="PlayerTick",
                   Type=NS(POST_UNCONDITIONAL=0),
                   _set_hook=set_hook, _set_optional_hook=set_hook,
+                  _pc=lambda: pc,
                   _local_pc=lambda obj: pc if obj is pc else None,
                   _clear_crosshair_widget=lambda: None,
                   _get_crosshair_widget=lambda *a, **k: widget,
@@ -148,9 +154,13 @@ class InstalledPerformanceTests(unittest.TestCase):
         schedule(pc, ticks=1, preserve_widget=True, widget=widget)
         self.assertEqual(repairs, ["repair"])
         tick = hooks["crosshair-resync-tick"]
+        update = hooks["crosshair-resync-update"]
+        offhand = obj(21, MyHUDMovie=widget.MyHUDMovie,
+                      bScopeCrosshair=False, bDualWieldCrosshair=True)
         tick(obj(2), None, None, None)
         self.assertEqual(ns["_crosshair_resync_missed_updates"], 0)
         for _ in range(2):
+            update(offhand, None, None, None)
             tick(pc, None, None, None)
             self.assertIn("crosshair-resync-update", hooks)
         tick(pc, None, None, None)

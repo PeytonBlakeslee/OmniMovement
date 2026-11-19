@@ -41,13 +41,16 @@ class HeldInputHandoff:
 
             process_id = os.getpid()
 
-            def read_keys(keys):
+            def focused():
                 hwnd = foreground()
                 if not hwnd:
-                    return tuple(False for _ in keys)
+                    return False
                 pid = ctypes.c_ulong()
                 get_pid(hwnd, ctypes.byref(pid))
-                if pid.value != process_id:
+                return pid.value == process_id
+
+            def read_keys(keys):
+                if not focused():
                     return tuple(False for _ in keys)
                 return tuple(bool(key(vk) & 0x8000) for vk in keys)
 
@@ -57,6 +60,7 @@ class HeldInputHandoff:
             # One current focus/PID sample per movement observation. Custom
             # readers without this optional method retain the original calls.
             held.sample_movement = lambda: read_keys((0x57, 0x53))
+            held.focused = focused
             return held
         except Exception:
             return None
@@ -97,7 +101,7 @@ class HeldInputHandoff:
 
             free_states = []
 
-            def poll():
+            def poll_axes():
                 # Buffers are leased only for an invocation. Nested calls must
                 # allocate/lease another buffer; all slots are still checked so
                 # hotplug and multi-controller ambiguity remain observable.
@@ -108,13 +112,19 @@ class HeldInputHandoff:
                         if get_state(slot, ctypes.byref(state)) == 0:
                             if value is not None:
                                 return None
-                            value = float(state.pad.left_y) / 32767.0
+                            value = tuple(max(-1.0, min(1.0, float(axis) / 32767.0))
+                                          for axis in (state.pad.left_y, state.pad.left_x))
                     if value is None:
                         return None
-                    return max(-1.0, min(1.0, value))
+                    return value
                 finally:
                     if len(free_states) < 4:
                         free_states.append(state)
+            def poll():
+                axes = poll_axes()
+                return None if axes is None else axes[0]
+
+            poll.sample_axes = poll_axes
             return poll
         except Exception:
             return None
@@ -206,7 +216,7 @@ class HeldInputHandoff:
         A new/native value is never overwritten. Failed reads and writes retain
         the owning entry for a later release event, not a blind retry.
         """
-        for prop in ("RawJoyUp", "aBaseY"):
+        for prop in ("RawJoyUp", "RawJoyRight", "aBaseY", "aStrafe"):
             owner = self._axis_owners.get(prop)
             if owner is None:
                 continue
@@ -267,7 +277,68 @@ class HeldInputHandoff:
         if not self._matches(self._axis(pi, prop), physical):
             raise RuntimeError("axis write not confirmed: " + prop)
 
-    def apply_pre(self, pi, ready):
+    def activation_gamepad_active(self, pi):
+        """Check the game's local input mode and the same focus guard as travel."""
+        focused = getattr(self.key_down, "focused", None)
+        try:
+            return bool(focused is not None and focused() and pi.bUsingGamepad)
+        except Exception:
+            return False
+
+    def activation_stick_sample(self, pi):
+        """Return a fresh independent controller sample only in gamepad mode."""
+        sample = getattr(self.controller_forward, "sample_axes", None)
+        try:
+            return sample() if sample is not None and self.activation_gamepad_active(pi) else None
+        except Exception:
+            return None
+
+    def bridge_activation_frame(self, pi, axes):
+        """Fill missing movement axes for one frame before PIProcessInput."""
+        if (self.synthetic or self._axis_owners or len(axes) != 2
+                or not all(math.isfinite(axis) and abs(axis) <= 1.25 for axis in axes)):
+            return False
+        props = ("aBaseY", "aStrafe", "RawJoyUp", "RawJoyRight")
+        try:
+            before = dict((prop, self._axis(pi, prop)) for prop in props)
+            missing = []
+            live_axis = False
+            for processed, raw, held in (("aBaseY", "RawJoyUp", axes[0]),
+                                         ("aStrafe", "RawJoyRight", axes[1])):
+                live = [before[prop] for prop in (processed, raw)
+                        if abs(before[prop]) > 0.015]
+                if live:
+                    live_axis = True
+                    # An actual input on either field owns this entire axis.
+                    # If it disagrees with the captured stick, do not complete
+                    # a diagonal the player may no longer be holding.
+                    if any(value * held <= 0 or abs(value - held) > 0.25 for value in live):
+                        return False
+                else:
+                    missing.append((processed, raw, held))
+            writes = [(prop, held) for processed, raw, held in missing
+                      if not live_axis or abs(held) >= 0.12 for prop in (processed, raw)]
+            if not writes:
+                return False
+            addr = pi._get_address()
+            if addr != self.pi_address:
+                self.pi_address, self.bound = addr, None
+            for prop, value in writes:
+                original = before[prop]
+                if self._axis(pi, prop) != original:
+                    raise RuntimeError("native input changed during activation handoff")
+                self._write_axis(pi, prop, value, original)
+        except Exception as exc:
+            self.last_error = "activation-axis-write-" + type(exc).__name__
+            self._pending_recovery = not self._release_owned(pi)
+            return False
+        # The normal input pipeline consumes these per-frame scalars after
+        # this hook and repopulates them on the next frame.
+        self._axis_owners.clear()
+        self._update_ownership()
+        return True
+
+    def apply_pre(self, pi, ready, *, keyboard_only=False):
         """Run POST WillowPlayerInput.PreProcessInput, before native PIProcessInput."""
         addr = pi._get_address()
         if addr != self.pi_address:
@@ -279,6 +350,12 @@ class HeldInputHandoff:
             self._update_ownership()
         self.last_sample_at = time.monotonic()
         source, physical = self._physical(pi) if ready else ('none', 0.0)
+        if keyboard_only:
+            try:
+                if source != 'keyboard' or self.key_down is None or self.key_down(0x53):
+                    source, physical = 'none', 0.0
+            except Exception:
+                source, physical = 'none', 0.0
         self.last_source = source
         self.last_physical = physical
 

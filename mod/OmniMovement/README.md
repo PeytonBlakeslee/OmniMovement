@@ -1,4 +1,4 @@
-# OmniMovement 1.1.17
+# OmniMovement 1.2.0
 
 Sprint in any direction in Borderlands 2, remember Walk/Sprint selection, and customize transitions, hip-fire behavior, reticle, accuracy and optional controller precision.
 
@@ -76,7 +76,7 @@ Defaults apply to new or missing options; your existing saved choices are preser
 - **Coyote Time:** Only normal on-foot, locally authorized ledge departures qualify. Menus, downing, vehicles, scripted launches and unsupported skill contexts invalidate the window; clients in co-op retain vanilla jumping.
 - **Travel:** Recovery after loading has a bounded budget of 24 eligible gameplay seconds, capped at 120 overall seconds. Repeated arrival events do not reset it.
 
-The maintainer subsequently reported a limited Windows BL2 gameplay smoke test of version 1.1.17 with the six mods installed, and the corresponding Player ZIP passed CI and package inspection. This does not verify every setting, a clean install, co-op, Proton/Wine or other configurations.
+These development observations do not certify a final Player ZIP, co-op, Proton/Wine or other configurations.
 
 ## Recovery and troubleshooting
 
@@ -86,7 +86,9 @@ The maintainer subsequently reported a limited Windows BL2 gameplay smoke test o
 
 ## Compatibility
 
-**Windows x86 Borderlands 2** is the primary package target; limited gameplay smoke acceptance was reported on the maintainer's existing installation. A separate clean-install test has not been performed. The Pre-Sequel is unsupported. Co-op host/client, controller reconnect and Proton/Wine remain unverified; native Linux BL2 is unsupported by this Win32 package.
+**Windows x86 Borderlands 2** is the primary package target; a separate clean-install gameplay acceptance test is pending. The Pre-Sequel is unsupported. Co-op host/client, controller reconnect and Proton/Wine remain unverified; native Linux BL2 is unsupported by this Win32 package.
+
+The gameplay candidate was tested on Steam BL2 build 9218157 (executable version 1.0.257.2863302), UnrealSDK 3.2.0, pyunrealsdk 1.10.0 and Python 3.14.6 on Windows. These identify the tested setup, not a guarantee for other versions. If the game or SDK updates and a feature stops working, check for an OmniMovement update and include the new versions in your report.
 
 Other input/movement mods have received source-level interaction review, not certification of every combination. OmniMovement does not alter global Steam Input, sensitivity or deadzone preferences.
 

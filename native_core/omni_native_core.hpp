@@ -84,10 +84,10 @@ private:
     double target_x_ = 0.0, target_y_ = 0.0;
     double speed_ = 0.0, elapsed_ = 0.0;
 };
-// Stage11: the actually used event-driven center-crossing math.
-// These are stateless and operate only on validated numeric snapshots.
-// Python keeps grace timing, interruption checks, active transition state,
-// Unreal object ownership and the final pawn.Velocity write.
+// Stateless center-crossing math on validated numeric snapshots.
+// Python retains grace timing, interruption checks, active transition state,
+// and Unreal object ownership checks. The guarded output boundary may write
+// through the native adapter or a permitted Python fallback.
 struct CenterBeginResult {
     bool accepted = false;
     double speed = 0.0;

@@ -42,9 +42,9 @@ class SprintFireSingleToggleTests(unittest.TestCase):
     def test_animation_coordination_only_when_native_entry_active(self):
         self.assertIn('if _active_fire_entry and _cfg_hip_fire:',
                       function_source("_began_sprint"))
-        self.assertIn('_active and _active_fire_entry',
+        self.assertIn('_active and (_active_fire_entry or after_equip)',
                       function_source("_sprint_fire_entry"))
-        self.assertIn('_active and _cfg_hip_fire and _active_fire_entry',
+        self.assertIn('_active and _cfg_hip_fire and pc.bInSprintState and _pose_fire_requested()',
                       function_source("_sprint_fire_entry_tick"))
         self.assertIn('_sprint_fire_entry_remaining = 6',
                       function_source("_sprint_fire_entry"))

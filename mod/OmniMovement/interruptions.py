@@ -7,27 +7,31 @@ def action_interrupted(
     *,
     weapon_transitioning=False,
     check_equipping_fallback=False,
+    check_weapon_transition=True,
 ):
     """Cheap hot-path guard; only call IsEquipping if state hooks were unavailable."""
     pawn = None if pc is None else pc.Pawn
     if pawn is None:
         return True
 
-    weapon = pawn.Weapon
-    interrupted = bool(
+    if (
         pc.bThrowingGrenade
         or pc.bPerformingSharedWeaponAction
         or pc.bPerformingMeleeAttack
-        or weapon_transitioning
-        or (weapon is not None and weapon.bWeaponPutDown)
-    )
-    if interrupted or not check_equipping_fallback or weapon is None:
-        return interrupted
+    ):
+        return True
+    if not check_weapon_transition:
+        return False
+    weapon = pawn.Weapon
+    if weapon_transitioning or (weapon is not None and weapon.bWeaponPutDown):
+        return True
+    if not check_equipping_fallback or weapon is None:
+        return False
 
     try:
         return bool(weapon.IsEquipping())
     except Exception:
-        return interrupted
+        return False
 
 
 class ActionSkid:

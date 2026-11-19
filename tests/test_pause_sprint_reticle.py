@@ -13,7 +13,7 @@ def load(name, ns):
 
 class PauseReticleTests(unittest.TestCase):
     def test_pause_close_arms_repair_for_remembered_sprint(self):
-        calls = []
+        calls, offhand = [], []
         pc = NS(bInSprintState=False)
         ns = dict(_local_pc=lambda obj: pc, _active=True, _travel_pending=False,
                   _cfg_assist=True, _armed=True, _cfg_omni=True, _cfg_gap=0.1,
@@ -21,6 +21,7 @@ class PauseReticleTests(unittest.TestCase):
                   _stop_crosshair_resync=lambda: None,
                   _release_crosshair_visibility=lambda: None,
                   _clear_crosshair_widget=lambda: None,
+                  _schedule_offhand_crosshair=offhand.append,
                   _schedule_crosshair_resync=lambda *a, **kw: calls.append(kw))
         fn = load('_crosshair_pause_state_post', ns)
         fn(pc, NS(bIsOpen=False), None, None)
@@ -28,9 +29,11 @@ class PauseReticleTests(unittest.TestCase):
         self.assertTrue(calls[0]['defer_first'])
         self.assertTrue(calls[0]['force_tick'])
         self.assertEqual(calls[0]['max_attempts'], 720)
+        self.assertEqual(offhand, [pc])
         ns['_armed'] = False
         fn(pc, NS(bIsOpen=False), None, None)
         self.assertEqual(len(calls), 1)
+        self.assertEqual(offhand, [pc])
 
     def test_lateral_melee_lurch_guard_preserves_native_exclusions(self):
         ns = dict(_knockback_until=0.0, time=NS(perf_counter=lambda: 1.0))

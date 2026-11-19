@@ -1,6 +1,6 @@
 [project]
 name = "omnimovement"
-version = "1.1.17"
+version = "1.2.0"
 authors = [{ name = "Peyton Blakeslee" }]
 description = "Sprint in any direction. See the included README or GitHub for a full settings guide."
 readme = "README.md"

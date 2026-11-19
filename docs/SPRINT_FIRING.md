@@ -1,6 +1,6 @@
 # Sprint-firing: Player Guide
 
-Applies to **OmniMovement v1.1.17** on Windows Borderlands 2. Get the matching Player Win32 ZIP from the [Releases page](https://github.com/PeytonBlakeslee/OmniMovement/releases) when available; GitHub-generated source archives are not installable Player packages.
+Applies to **OmniMovement v1.2.0** on Windows Borderlands 2.
 
 **Contents:** [Setup](#setup) · [Sprint-firing options](#sprint-firing-options) · [Quick in-game check](#quick-in-game-check) · [Recovery and rollback](#recovery-and-rollback)
 
@@ -10,7 +10,7 @@ Install a complete matching Player Win32 ZIP as described in the [player guide](
 
 ## Sprint-firing options
 
-**Sprint While Hip-Firing** is On by default. **Begin Sprint While Firing** is On by default and requires the first option.
+**Sprint While Hip-Firing** and **Begin Sprint While Firing** are On by default; the latter requires the former.
 
 | Begin Sprint While Firing | Expected behavior |
 | --- | --- |

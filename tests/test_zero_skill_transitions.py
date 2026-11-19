@@ -143,7 +143,7 @@ class InitialDeceptionTests(unittest.TestCase):
         args = NS(TheController=pc)
         skill = NS(Class=NS(Name="ExecuteActionSkill"), MyWillowPawn=pc.Pawn)
         env = {
-            "_active": True, "_cfg_omni": True,
+            "_active": True, "_cfg_omni": True, "_cfg_crosshair": False,
             "_zero_deception_cast_edge": None, "_coyote_enabled": lambda: False,
             "_local_pc": lambda c: c,
             "_same": lambda a, b: a is b,

@@ -93,6 +93,27 @@ class IntentBridgeTests(unittest.TestCase):
         self.assertFalse(observations[0][-3])  # Current CanSprint permission.
         self.assertNotIn(('try', True), calls)
 
+    def test_native_omni_intent_distinguishes_swap_from_action_blocker(self):
+        ns, pc, calls, _, native, _ = self.setup_bridge()
+        ns['_cfg_omni'] = True
+        ns['_weapon_transition_addresses'].add(123)
+        pc.Pawn.Weapon.bWeaponPutDown = True
+        native.assist_combat_v1 = lambda *args: (False, pc.bPerformingMeleeAttack, False,
+                                                True, True, False)
+
+        def observe(*args):
+            permitted = args[-3]
+            return (6 if permitted else 4), True, permitted, permitted, False
+
+        native.intent_observe = observe
+        tick = ns['_assist_recovery_tick']
+        tick(pc, None, None, None)
+        self.assertEqual(calls[-2:], ['CanSprint', ('try', True)])
+        pc.bPerformingMeleeAttack = True
+        tick(pc, None, None, None)
+        self.assertEqual(calls.count(('try', True)), 1)
+        self.assertEqual(calls.count('CanSprint'), 1)
+
     def test_retry_request_stays_pending_until_actual_sprint(self):
         ns, pc, calls, adapter, native, observations = self.setup_bridge((6, True, True, True, False))
         ns['_assist_recovery_tick'](pc, None, None, None)

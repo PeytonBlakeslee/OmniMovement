@@ -651,12 +651,13 @@ class PrecisionSprint:
                             'using Python fallback: ' + repr(exc))
 
     def velocity_write(self, pc, pi, pawn, epoch, vx, vy):
-        """True committed, False rejected context, None guarded Python fallback.
+        """True means committed; False means rejected or uncertain native write.
 
-        This is only called after Python's existing gameplay/context gates.
-        Native checks current objects and motion generation, without relying
-        on Precision's separate SprintingPct owner. Rejection forbids fallback.
-        A write-path failure does not quarantine Precision Sprint's speed owner.
+        None permits guarded Python fallback on this frame. This is called
+        after Python's gameplay/context gates; native code independently checks
+        object and motion-generation ownership. False forbids same-frame
+        fallback. Write failures do not quarantine Precision Sprint's separate
+        SprintingPct owner.
         """
         if self._native_velocity_failed or self._native_motion_fusion_failed:
             return None

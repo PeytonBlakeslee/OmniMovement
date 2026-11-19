@@ -17,6 +17,7 @@ class SalFireInputTests(unittest.TestCase):
         self.pawn = NS(OffHandWeapon=object(), bReloading=False)
         self.pc = NS(Pawn=self.pawn, bInSprintState=True, WorldInfo=NS(TimeSeconds=10.0))
         self.ns = dict(_active=True, _cfg_hip_fire=True, _cfg_assist=False, _armed=False,
+            DUAL_FIRE_RELEASE_DELAY=0.10,
             _active_fire_entry=True, _fire_requested=False, _pose_offhand_requested=False,
             _pose_release_at=0.0, _hip_hooks_until=0.0, _hip_hooks_live=False,
             _fire_until=0.0, _sprint_fire_entry_remaining=0, _pose_reload_retry=0,
@@ -28,10 +29,11 @@ class SalFireInputTests(unittest.TestCase):
             _stop_sprint_fire_entry_probe=lambda: self.events.append(('probe-stop',)),
             _set_hook=lambda *a: self.events.append(('set-hook', a[0], a[1])),
             _weapon_belongs_to_local=lambda obj: True,
+            _opposite_hand_fire_during_reload=lambda pc, pawn: False,
             _fire_pose=NS(restore=lambda: self.events.append(('restore',)), aliases_active=True),
             PLAYER_TICK='tick', Type=NS(POST_UNCONDITIONAL='post'))
         load({'_start_fire','_stop_fire','_pose_fire_requested','_pose_reload_begin',
-              '_pose_reload_end','_stop_pose_reload_retry','_pose_reload_retry_tick'}, self.ns)
+              '_pose_reload_end','_pose_reload_end_retry','_stop_pose_reload_retry','_pose_reload_retry_tick'}, self.ns)
 
     def start(self, mode): self.ns['_start_fire'](self.pc, NS(FireModeNum=mode), None, None)
     def stop(self, mode): self.ns['_stop_fire'](self.pc, NS(FireModeNum=mode), None, None)
@@ -61,6 +63,27 @@ class SalFireInputTests(unittest.TestCase):
         self.assertFalse(self.ns['_pose_fire_requested']())
         self.assertNotIn(('pose',True), self.events)
 
+    def test_ready_hand_updates_pose_while_other_hand_equips(self):
+        load({'_ready_gunzerk_hand_can_fire_during_swap', '_update_fire_pose'}, self.ns)
+        self.pawn.Weapon, self.pawn.OffHandWeapon = NS(ready=False), NS(ready=True)
+        self.pc.PlayerInput = NS(CurrentInputContextName='Gunzerking')
+        self.pc.bGunzerkingAutoSwitch = False
+        self.pc.bThrowingGrenade = self.pc.bPerformingMeleeAttack = False
+        self.pc.bPerformingSharedWeaponAction = False
+        self.ns.update(_combat_fire_mask=2,
+                       _crosshair_weapon_ready=lambda w: w.ready,
+                       _fire_pose_eligible=lambda *a, interrupted, **kw: not interrupted)
+        self.ns['_fire_pose'].update = lambda pc, **kw: self.events.append(kw['eligible'])
+        update = self.ns['_update_fire_pose']
+        update(self.pc, firing=True, now=10, interrupted=True, zoomed=False)
+        self.ns['_combat_fire_mask'] = 1
+        update(self.pc, firing=True, now=10, interrupted=True, zoomed=False)
+        self.pawn.Weapon.ready, self.pawn.OffHandWeapon.ready = True, False
+        update(self.pc, firing=True, now=10, interrupted=True, zoomed=False)
+        self.pc.bPerformingMeleeAttack = True
+        update(self.pc, firing=True, now=10, interrupted=True, zoomed=False)
+        self.assertEqual(self.events, [True, False, True, False])
+
     def test_offhand_reload_is_detected_without_main_pawn_flag(self):
         load({'_pose_reload_active'}, self.ns)
         main = NS(_get_address=lambda: 1, GetStateName=lambda: 'Active')
@@ -71,6 +94,29 @@ class SalFireInputTests(unittest.TestCase):
         self.assertFalse(self.ns['_pose_reload_active'](self.pawn))
         self.ns['_pose_reload_addresses'].add(99)
         self.assertFalse(self.ns['_pose_reload_active'](self.pawn))
+
+    def test_reload_pose_uses_the_other_hand_in_both_trigger_layouts(self):
+        load({'_opposite_hand_fire_during_reload'}, self.ns)
+        self.pc.PlayerInput = NS(CurrentInputContextName='Gunzerking')
+        self.pawn.Weapon, self.pawn.OffHandWeapon = (
+            NS(_get_address=lambda address=address: address, GetStateName=lambda: 'Active')
+            for address in (101, 102))
+        eligible = self.ns['_opposite_hand_fire_during_reload']
+        for switched in (False, True):
+            self.pc.bGunzerkingAutoSwitch = switched
+            for hand in (0, 1):
+                reloading = (self.pawn.Weapon, self.pawn.OffHandWeapon)[hand]
+                self.ns['_pose_reload_addresses'].clear()
+                self.ns['_combat_fire_mask'] = 1 << ((1 - hand) ^ switched)
+                self.events.clear()
+                self.ns['_pose_reload_begin'](reloading, None, None, None)
+                self.assertIn(('pose', True), self.events)
+                self.assertNotIn(('restore',), self.events)
+                self.ns['_combat_fire_mask'] = 1 << (hand ^ switched)
+                self.assertFalse(eligible(self.pc, self.pawn))
+                self.ns['_combat_fire_mask'] = 3
+                self.ns['_pose_reload_addresses'].update((101, 102))
+                self.assertFalse(eligible(self.pc, self.pawn))
 
     def test_reload_releases_pose_until_both_weapons_finish(self):
         a=NS(_get_address=lambda: 101); b=NS(_get_address=lambda: 102)
@@ -86,5 +132,46 @@ class SalFireInputTests(unittest.TestCase):
         self.ns['_pose_reload_retry_tick'](self.pc,None,None,None)
         self.assertIn(('pose',True), self.events)
         self.assertEqual(self.ns['_pose_reload_retry'],0)
+
+    def test_faster_hand_can_retry_pose_while_other_hand_reloads(self):
+        load({'_opposite_hand_fire_during_reload'}, self.ns)
+        self.pc.PlayerInput = NS(CurrentInputContextName='Gunzerking')
+        self.pawn.Weapon, self.pawn.OffHandWeapon = (
+            NS(_get_address=lambda address=address: address, GetStateName=lambda: 'Active')
+            for address in (101, 102))
+        for switched in (False, True):
+            for slow_hand in (0, 1):
+                with self.subTest(switched=switched, slow_hand=slow_hand):
+                    self.pc.bGunzerkingAutoSwitch = switched
+                    self.pawn.bReloading = True
+                    slow = (self.pawn.Weapon, self.pawn.OffHandWeapon)[slow_hand]
+                    self.ns['_pose_reload_addresses'] = {slow._get_address()}
+                    self.ns['_combat_fire_mask'] = 1 << ((1 - slow_hand) ^ switched)
+                    self.ns['_fire_requested'] = bool(self.ns['_combat_fire_mask'] & 1)
+                    self.ns['_pose_offhand_requested'] = bool(self.ns['_combat_fire_mask'] & 2)
+                    self.ns['_fire_pose'].aliases_active = True
+                    self.events.clear()
+                    self.ns['_pose_reload_end_retry']()
+                    self.ns['_pose_reload_retry_tick'](self.pc, None, None, None)
+                    self.assertIn(('pose', True), self.events)
+                    self.assertEqual(self.ns['_pose_reload_retry'], 0)
+                    self.assertEqual(self.ns['_pose_reload_addresses'], {slow._get_address()})
+
+                    # The player may begin firing only after the first reload ended.
+                    self.ns['_fire_requested'] = self.ns['_pose_offhand_requested'] = False
+                    self.ns['_combat_fire_mask'] = 0
+                    self.ns['_combat_fire_edge'] = lambda pc, mode, pressed: self.ns.update(
+                        _combat_fire_mask=(1 << mode) if pressed else 0)
+                    self.ns['_fire_pose'].aliases_active = False
+                    self.events.clear()
+                    self.start((1 - slow_hand) ^ switched)
+                    self.assertIn(('set-hook', 'pose-reload-retry', True), self.events)
+
+                    # Neither trigger nor a still-reloading firing hand may keep a retry alive.
+                    self.ns['_combat_fire_mask'] = 1 << (slow_hand ^ switched)
+                    self.events.clear()
+                    self.ns['_pose_reload_retry_tick'](self.pc, None, None, None)
+                    self.assertNotIn(('pose', True), self.events)
+                    self.assertEqual(self.ns['_pose_reload_retry'], 0)
 
 if __name__ == '__main__': unittest.main()

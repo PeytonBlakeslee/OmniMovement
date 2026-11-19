@@ -8,10 +8,30 @@ import ast
 from pathlib import Path
 from types import SimpleNamespace as NS
 import unittest
+from test_combat_bridge import MOD, load_definitions
 
 SOURCE = (Path(__file__).resolve().parents[1] /
           "mod" / "OmniMovement" / "fire_pose.py").read_text(encoding="utf-8-sig")
 TREE = ast.parse(SOURCE)
+
+
+class PoseCleanupTests(unittest.TestCase):
+    def test_foreign_tick_cannot_restore_local_release_pose(self):
+        calls = []
+        pc = NS(bInSprintState=True, WorldInfo=NS(TimeSeconds=10.2))
+        ns = dict(_active=True, _cfg_hip_fire=True, _pose_release_at=10.18,
+                  _hip_hooks_live=True, _hip_hooks_until=10.18,
+                  _local_pc=lambda obj: pc if obj is pc else None,
+                  _fire_pose=NS(restore=lambda: calls.append("restore")),
+                  _sync_fire_hooks=lambda enable: calls.append(enable),
+                  _pose_fire_requested=lambda: False,
+                  _update_fire_pose=lambda *a, **kw: calls.append("release"))
+        load_definitions(MOD / "__init__.py", ["_hip_cleanup_tick"], ns)
+        tick = ns["_hip_cleanup_tick"]
+        tick(object(), None, None, None)
+        self.assertEqual(calls, [])
+        tick(pc, None, None, None)
+        self.assertEqual(calls, ["release", False])
 
 
 class Obj:

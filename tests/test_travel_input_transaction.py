@@ -116,6 +116,50 @@ class TransactionTests(unittest.TestCase):
         env["_stop_travel_input_handoff"]()
         return hooks,warnings,resets
 
+    def test_existing_loading_keyboard_can_continue_but_not_take_over_with_controller(self):
+        self.assertTrue(self.h.apply_pre(self.pi, True))
+        # The new context clears frame axes but physically held W is unchanged.
+        self.pi.axis.update(aBaseY=0.0, RawJoyUp=0.0)
+        self.assertTrue(self.h.apply_pre(self.pi, True, keyboard_only=True))
+        self.assertEqual(self.pi.aBaseY, 1.0)
+        self.down = False
+        self.h.controller_forward = lambda: 0.9
+        self.assertFalse(self.h.apply_pre(self.pi, True, keyboard_only=True))
+        self.assertEqual(self.pi.aBaseY, 0.0)
+        self.assert_clean()
+
+    def test_activation_frame_uses_both_axes_and_never_overwrites_native_input(self):
+        pi = NS(_get_address=lambda: 9, aBaseY=0.0, aStrafe=0.0,
+                RawJoyUp=0.0, RawJoyRight=0.0)
+        self.assertTrue(self.h.bridge_activation_frame(pi, (0.1, -0.85)))
+        self.assertEqual((pi.aBaseY, pi.aStrafe, pi.RawJoyUp, pi.RawJoyRight),
+                         (0.1, -0.85, 0.1, -0.85))
+        self.assert_clean()
+        self.assertFalse(self.h.bridge_activation_frame(pi, (0.8, 0.0)))
+        self.assertEqual((pi.aBaseY, pi.aStrafe), (0.1, -0.85))
+
+    def test_backward_diagonal_restores_only_missing_axis(self):
+        for side in (-0.65, 0.65):
+            for keep_back in (False, True):
+                with self.subTest(side=side, keep_back=keep_back):
+                    forward_input, side_input = (-0.72, 0.0) if keep_back else (0.0, side)
+                    pi = NS(_get_address=lambda: 9, aBaseY=forward_input, aStrafe=side_input,
+                            RawJoyUp=forward_input, RawJoyRight=side_input)
+                    self.assertTrue(self.h.bridge_activation_frame(pi, (-0.75, side)))
+                    expected = (-0.72, side) if keep_back else (-0.75, side)
+                    self.assertEqual((pi.aBaseY, pi.aStrafe), expected)
+                    self.assertEqual((pi.RawJoyUp, pi.RawJoyRight), expected)
+                    self.assert_clean()
+
+    def test_partial_activation_frame_rejects_conflict_and_negligible_axis(self):
+        pi = NS(_get_address=lambda: 9, aBaseY=-0.7, aStrafe=0.0,
+                RawJoyUp=-0.7, RawJoyRight=0.0)
+        self.assertFalse(self.h.bridge_activation_frame(pi, (0.7, 0.65)))
+        self.assertFalse(self.h.bridge_activation_frame(pi, (-0.7, 0.04)))
+        self.assertEqual((pi.aBaseY, pi.aStrafe, pi.RawJoyUp, pi.RawJoyRight),
+                         (-0.7, 0.0, -0.7, 0.0))
+        self.assert_clean()
+
     def test_hook_retirement_restores_owned_fields_before_forgetting_them(self):
         self.assertTrue(self.h.apply_pre(self.pi,True))
         hooks,warnings,resets=self.stop_handoff()

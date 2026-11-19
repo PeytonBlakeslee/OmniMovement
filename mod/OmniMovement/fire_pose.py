@@ -1,6 +1,8 @@
 """Owned first-person sprint/fire posture changes with no permanent tick."""
 import unrealsdk
 
+DUAL_FIRE_RELEASE_DELAY = 0.10
+
 
 # A deployed/ongoing action skill is not equivalent to a casting animation.
 # Weapon/movement interruption state is checked by the caller, rather than
@@ -400,7 +402,9 @@ class FirePose:
         if firing:
             self.last_fire = now
 
-        target = 0 if firing or now - self.last_fire < 0.18 else 2
+        dual = getattr(pawn, "OffHandWeapon", None) is not None
+        release_delay = DUAL_FIRE_RELEASE_DELAY if dual else 0.18
+        target = 0 if firing or now - self.last_fire < release_delay else 2
         if int(node.ActiveChildIndex) != 2:
             self._release_aliases(node)
             return
@@ -414,7 +418,10 @@ class FirePose:
 
         if target != self.target:
             node.TargetWeight = [float(i == target) for i in range(3)]
-            node.BlendTimeToGo = 0.08 if target == 0 else 0.20
+            if dual:
+                node.BlendTimeToGo = 0.10 if target == 0 else 0.14
+            else:
+                node.BlendTimeToGo = 0.08 if target == 0 else 0.20
             self.target = target
 
 

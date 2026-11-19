@@ -10,7 +10,7 @@ from mods_base import SETTINGS_DIR, BoolOption, GroupedOption, Mod, SliderOption
 from unrealsdk import logging
 from unrealsdk.hooks import Block, Type, Unset
 
-from .fire_pose import AdaptiveFirePose, on_foot, firing_pose_context
+from .fire_pose import AdaptiveFirePose, DUAL_FIRE_RELEASE_DELAY, on_foot, firing_pose_context
 from .travel_input import HeldInputHandoff
 from .recovery_budget import RecoveryBudget
 from .interruptions import ActionSkid, action_interrupted
@@ -59,6 +59,7 @@ INIT_ACCURACY = "WillowGame.WillowPlayerController:InitAccuracyFromWeapon"
 ATTRIBUTE_MODIFIER = "Engine.AttributeDefinitionBase:AddAttributeModifier"
 PLAYER_TICK = "WillowGame.WillowPlayerController:PlayerTick"
 INPUT_FRAME = "WillowGame.WillowPlayerInput:PreProcessInput"
+POST_PLAYER_INPUT = "WillowGame.WillowPlayerInput:PlayerInput"
 # SDK hook dispatch matches the canonical path, with the state after the colon.
 WALKING_PROCESS_MOVE = "WillowGame.WillowPlayerController:PlayerWalking.ProcessMove"
 # Called between Engine.PlayerInput.RawJoy snapshot and native PIProcessInput.
@@ -80,6 +81,8 @@ DO_JUMP = "WillowGame.WillowPlayerPawn:DoJump"
 BASE_CAN_JUMP = "Engine.Pawn:CanJump"
 SET_PHYSICS = "Engine.Actor:SetPhysics"
 
+WEAPON_BRINGUP = "WillowGame.WillowWeapon:InitializeWeaponAfterBringUp"
+WEAPON_DROP = "WillowGame.WillowWeapon:DropFrom"
 WEAPON_STATE_PATHS = (
     (
         "equip-begin",
@@ -146,6 +149,7 @@ _pause_sprint_grace_until = 0.0
 _ads_sprint_edge = None
 _combat_action_active = False
 _combat_fire_mask = 0
+_combat_fire_tail = None  # (controller, pawn, offhand addresses, grace end, deadline)
 _try_sprint_written = None
 _assist_recovery_ready_frames = 0
 _assist_airborne_hold = False
@@ -163,6 +167,7 @@ _sprint_fire_entry_remaining = 0
 _fire_pose = AdaptiveFirePose()
 _action_skid = ActionSkid()
 _travel_input = HeldInputHandoff()
+_activation_input_frame = None  # same-pawn, one native input frame after Gunzerk context entry
 _precision = PrecisionSprint()
 
 # Kept separately from airborne/action interruption handling. A map transition
@@ -215,6 +220,8 @@ _knockback_until = 0.0
 _continuation_depth = 0
 
 _weapon_transition_addresses = set()
+_equip_sprint_handoffs = {}  # hand -> exact equip record, valid only for a bounded local handoff
+_drop_sprint_scope = None  # exact local equip owner and deadline for a synchronous DropFrom
 _weapon_transition_refs = {}
 _weapon_state_events_complete = False
 
@@ -229,6 +236,10 @@ _accuracy_rules = {
 
 _crosshair_widget = None
 _crosshair_forced_widget = None
+_offhand_crosshair = None  # weak widget and original inner clip visibility
+_offhand_crosshair_retry = None  # pawn identity, deadline, next sample
+_offhand_associated_widget = None  # exact widget from native AssociateWeapon
+_offhand_native_updates = {}  # exact widgets updated since the last retry sample
 _crosshair_inner_visible = None
 _crosshair_movie_address = 0
 _crosshair_weapon_address = 0
@@ -1114,7 +1125,7 @@ def _assist_raw_moving(pc, *, pi=None):
 
 
 def _assist_can_retry(pc, *, native_snapshot=None, pi=None, pawn=None,
-                      context_validated=False):
+                      context_validated=False, allow_weapon_swap=False):
     """Authoritative CanSprint check with optional native rejection snapshot.
 
     The native snapshot NEVER permits sprint or replaces context/weapon checks.
@@ -1148,21 +1159,25 @@ def _assist_can_retry(pc, *, native_snapshot=None, pi=None, pawn=None,
         if native_snapshot[1] or native_snapshot[2]:
             return False
         weapon = pawn.Weapon
-        put_down = (native_snapshot[4] if len(native_snapshot) >= 6
-                    else weapon is not None and weapon.bWeaponPutDown)
-        if _has_weapon_transition(pc) or put_down:
-            return False
-        if not _weapon_state_events_complete and weapon is not None:
-            try:
-                if bool(weapon.IsEquipping()):
-                    return False
-            except Exception:
-                pass
+        if not allow_weapon_swap:
+            put_down = (native_snapshot[4] if len(native_snapshot) >= 6
+                        else weapon is not None and weapon.bWeaponPutDown)
+            if _has_weapon_transition(pc) or put_down:
+                return False
+            if not _weapon_state_events_complete and weapon is not None:
+                try:
+                    if bool(weapon.IsEquipping()):
+                        return False
+                except Exception:
+                    pass
         weapon_zoomed = native_snapshot[5] if len(native_snapshot) >= 6 else None
         if _fast_zoomed(pc, weapon, pending_zoom=False, weapon_zoomed=weapon_zoomed):
             return False
-    elif _interrupted(pc) or _fast_zoomed(pc, pawn.Weapon):
-        return False
+    else:
+        interrupted = (action_interrupted(pc, check_weapon_transition=False)
+                       if allow_weapon_swap else _interrupted(pc))
+        if interrupted or _fast_zoomed(pc, pawn.Weapon):
+            return False
     try:
         allowed = bool(pawn.CanSprint())
         if allowed and context_validated:
@@ -1367,11 +1382,12 @@ def _assist_recovery_tick(obj, args, ret, func):
         return
     if _native_assist_recovery(pc, pi, pawn=pawn, context_validated=True):
         return
-    # Stage20: one native read covers action, weapon, input and debounce.
-    # State-function overrides, local context and CanSprint remain authoritative.
+    # The older native retry combines put-down with real action blockers.
+    # Read its raw snapshot in Omni mode so the retry can distinguish them.
+    allow_weapon_swap = _cfg_omni
     combat = _precision.combat_observe(
-        pc, pi, retry=True,
-        weapon_transitioning=_has_weapon_transition(pc),
+        pc, pi, retry=not allow_weapon_swap, recovery_only=allow_weapon_swap,
+        weapon_transitioning=not allow_weapon_swap and _has_weapon_transition(pc),
         prefer_native=_cfg_native_precision)
     native_observation = None if combat is None else combat[0]
     if native_observation is not None:
@@ -1416,11 +1432,13 @@ def _assist_recovery_tick(obj, args, ret, func):
     # Only definite blockers can short circuit here: action flags and zoom.
     # The unblocked result NEVER grants sprint. All other engine, weapon and
     # character-specific checks run through the existing Python predicate.
+    snapshot = None if combat is None else combat[1]
     blocked = (
         _precision.retry_preflight_blocked(pc, prefer_native=_cfg_native_precision)
-        if _assist_recovery_ready_frames == 0 else None
+        if snapshot is None and _assist_recovery_ready_frames == 0 else None
     )
-    if blocked is True or not _assist_can_retry(pc):
+    if blocked is True or not _assist_can_retry(
+            pc, native_snapshot=snapshot, allow_weapon_swap=allow_weapon_swap):
         _assist_recovery_ready_frames = 0
         _precision.reset_assist('retry')
         _set_try_sprint(pc.PlayerInput, False)
@@ -1541,7 +1559,7 @@ def _native_assist_recovery(pc, pi, *, pawn=None, context_validated=False):
                         and not (snapshot is not None and (snapshot[1] or snapshot[2])))
     permitted = check_permission and _assist_can_retry(
         pc, native_snapshot=snapshot, pi=pi, pawn=pawn,
-        context_validated=context_validated)
+        context_validated=context_validated, allow_weapon_swap=_cfg_omni)
     decision = _precision.intent_observe(
         pc, pi, _travel_epoch, _armed, context_ready=context_ready,
         sprinting=sprinting, moving=moving, grounded=grounded,
@@ -1628,8 +1646,9 @@ def _clear_center_transition(*, remove_hook=True):
 def _set_native_hipfire(enabled):
     """Patch sprint continuation and optionally validated sprint initiation.
 
-    The optional CanSprint change is frozen per enable-cycle; changing the
-    toggle mid-game requires disabling and re-enabling OmniMovement.
+    Sprint-entry selection is captured when the mod is enabled. Changing that
+    setting requires disabling and re-enabling OmniMovement. Any patch mode
+    transition restores the owned patch first; a failed restore prevents it.
     """
     global _native_hipfire_active, _active_fire_entry
     enabled = bool(enabled and _active and _cfg_hip_fire)
@@ -1661,9 +1680,7 @@ def _set_native_hipfire(enabled):
     _active_fire_entry = bool(
         _native_hipfire_active and _native_hipfire.start_while_firing
     )
-    if _native_hipfire_active:
-        pass
-    else:
+    if not _native_hipfire_active:
         logging.warning(
             "omnimovement: validated native sprint-fire unavailable; "
             "using Python continuation fallback; experimental sprint entry DISABLED: "
@@ -1828,6 +1845,12 @@ def _action_skill_started(obj, args, ret, func):
     """Track Zer0's native cast transition; keep Doppelganger policy unchanged."""
     global _deathtrap_skill_active, _deathtrap_skill_ref, _deathtrap_context_seen
     global _zero_deception_cast_edge
+    if _active and _cfg_crosshair:
+        try:
+            if str(obj.Class.Name) == "DualWieldActionSkill":
+                _schedule_offhand_crosshair(_local_pc(args.TheController), pending_draw=True)
+        except Exception:
+            pass
     if _active and _cfg_omni:
         try:
             if str(obj.Class.Name) == "ExecuteActionSkill":
@@ -1898,6 +1921,8 @@ def _input_context_changed(obj, args, ret, func):
     if pi is None:
         return
     pc = _pc()
+    if _equip_sprint_handoffs:
+        _equip_sprint_context_post(pc, pi)
     if _coyote_enabled():
         _coyote_seed(pc)
     # Skill activation can hide/rebuild the native GFx reticle without ending
@@ -1909,6 +1934,14 @@ def _input_context_changed(obj, args, ret, func):
             _schedule_crosshair_resync(
                 pc, ticks=3, force_tick=True, max_attempts=60,
             )
+    try:
+        if str(pi.CurrentInputContextName) == "Gunzerking":
+            _schedule_offhand_crosshair(pc, pending_draw=True)
+        elif _offhand_crosshair is not None or _offhand_crosshair_retry is not None:
+            _release_offhand_crosshair()
+            _stop_offhand_crosshair_retry()
+    except Exception:
+        pass
     if not _deathtrap_skill_active:
         return
     try:
@@ -1922,6 +1955,10 @@ def _input_context_changed(obj, args, ret, func):
         _finish_deathtrap_guard(pc)
 
 def _reset_runtime_motion():
+    _stop_activation_input_frame()
+    _clear_equip_sprint_handoffs()
+    _stop_offhand_crosshair_retry()
+    _release_offhand_crosshair(refresh_native=False)
     _coyote.invalidate()
     global _zero_final_physics_snapshot, _zero_deception_cast_edge
     global _zero_execute_waiting_cleanup, _zero_execute_seed_pending
@@ -1930,6 +1967,7 @@ def _reset_runtime_motion():
     global _combat_action_active, _combat_fire_mask
     _combat_action_active = False
     _combat_fire_mask = 0
+    _stop_combat_fire_tail()
     _pose_reload_addresses.clear()
     _stop_pose_reload_retry()
     _sync_combat_sprint_hooks()
@@ -2089,32 +2127,109 @@ def _melee_dispatch_enter(obj, args, ret, func):
         _melee_nonforward_event_at = 0.0
 
 
-def _combat_sprint_safe(pc, pawn):
+def _main_reload_allows_offhand_sprint(pc, pawn, *, release=False):
+    """Recognize a main-hand reload while the live offhand still owns fire."""
+    try:
+        main, offhand = pawn.Weapon, pawn.OffHandWeapon
+        if main is None or offhand is None or str(pc.PlayerInput.CurrentInputContextName) != "Gunzerking":
+            return False
+        offhand_bit = 1 if pc.bGunzerkingAutoSwitch else 2
+        if not (_combat_fire_mask & offhand_bit or (release and _combat_tail_matches(pc, pawn))):
+            return False
+        def reloading(weapon):
+            return (weapon._get_address() in _pose_reload_addresses
+                    or str(weapon.GetStateName()).lower() == "weaponreloading")
+        return reloading(main) and not reloading(offhand)
+    except Exception:
+        return False
+
+
+def _opposite_hand_fire_during_reload(pc, pawn):
+    """Allow the firing stance only when one known reload leaves a firing hand."""
+    try:
+        main, offhand = pawn.Weapon, pawn.OffHandWeapon
+        if main is None or offhand is None or str(pc.PlayerInput.CurrentInputContextName) != "Gunzerking":
+            return False
+        if not _combat_fire_mask:
+            return False
+        def reloading(weapon):
+            return (weapon._get_address() in _pose_reload_addresses
+                    or str(weapon.GetStateName()).lower() == "weaponreloading")
+        main_reloading, offhand_reloading = reloading(main), reloading(offhand)
+        if main_reloading == offhand_reloading:
+            return False
+        offhand_bit = 1 if pc.bGunzerkingAutoSwitch else 2
+        return bool(_combat_fire_mask & (offhand_bit if main_reloading else 3 ^ offhand_bit))
+    except Exception:
+        return False
+
+
+def _combat_sprint_safe(pc, pawn, *, allow_offhand_reload=False, release=False,
+                        other_weapon_reloading=False, airborne_offhand=False):
     """Fail closed when native locomotion or another action owns movement."""
     try:
         return bool(pc is not None and pawn is not None and _same(pc.Pawn, pawn)
             and _basic_context(pc, pawn=pawn, fire_pose_only=True)
-            and int(pawn.Physics) == 1 and not pawn.bDeleteMe
-            and not pc.bDuck and not pc.bPressedJump
+            and (int(pawn.Physics) == 1 or airborne_offhand) and not pawn.bDeleteMe
+            and not pc.bDuck and (not pc.bPressedJump or airborne_offhand)
             and not pawn.bIsCrouched and not pawn.bWantsToCrouch
-            and not pawn.bReloading and not pawn.bForceRMVelocity
+            and (not pawn.bReloading or other_weapon_reloading or (allow_offhand_reload
+                 and _main_reload_allows_offhand_sprint(pc, pawn, release=release)))
+            and not pawn.bForceRMVelocity
             and not pawn.bForceRegularVelocity and not pawn.bRMForceStop
             and not _fast_zoomed(pc, pawn.Weapon))
     except Exception:
         return False
 
 
+def _combat_release_safe(pc, pawn):
+    """Only continue an already held, ordinary sprint through fire release."""
+    pri = pc.PlayerReplicationInfo
+    return bool(
+        not _crosshair_modal_open and not _travel_modal_open
+        and pc.WorldInfo.Pauser is None and pri is not None and not pri.bGFxMenuOpen
+        and _assist_raw_moving(pc) and time.perf_counter() >= _knockback_until
+        and not _crouch_sprint_paused() and not _zero_execute_waiting()
+        and not _interrupted(pc) and (not _pose_reload_active(pawn)
+            or _main_reload_allows_offhand_sprint(pc, pawn, release=True)))
+
+
+def _airborne_offhand_continuation(pc, pawn):
+    try:
+        return bool(
+            _cfg_hip_fire and int(pawn.Physics) == 2 and pawn.OffHandWeapon is not None
+            and str(pc.PlayerInput.CurrentInputContextName) == "Gunzerking"
+            and not pc.bPerformingSharedWeaponAction and not pc.bPerformingMeleeAttack
+            and not pc.bThrowingGrenade
+            and (_combat_fire_mask & (1 if pc.bGunzerkingAutoSwitch else 2)
+                 or _combat_tail_matches(pc, pawn)))
+    except Exception:
+        return False
+
+
 def _combat_continue_override(obj, args, ret, func):
-    """Bypass only the shared-action and offhand firing continuation gates."""
+    """Replace native continuation only for guarded local combat cases.
+
+    A successful PRE override skips the full native eligibility result, not
+    just its shared-action or offhand-firing condition.
+    """
     if not (_active and _cfg_omni and _is_local_pawn(obj)):
         return
     pc = _pc()
-    if pc is None or not pc.bInSprintState or not _combat_sprint_safe(pc, obj):
+    if pc is None or not pc.bInSprintState or not _combat_sprint_safe(
+            pc, obj, allow_offhand_reload=_cfg_hip_fire, release=True,
+            airborne_offhand=_airborne_offhand_continuation(pc, obj)):
         return
     try:
         action = bool(_combat_action_active and _cfg_assist and _armed
                       and pc.bPerformingSharedWeaponAction)
-        offhand = bool(_combat_fire_mask and _cfg_hip_fire and obj.OffHandWeapon is not None)
+        offhand = False
+        if _cfg_hip_fire and obj.OffHandWeapon is not None:
+            offhand = bool(_combat_fire_mask)
+            if not offhand and _combat_tail_matches(pc, obj):
+                offhand = (not (_cfg_assist and _armed)
+                           or time.perf_counter() < _combat_fire_tail[3]
+                           or _combat_release_safe(pc, obj))
         if not (action or offhand) or (pc.bPerformingSharedWeaponAction and not action):
             return
         weapon = obj.Weapon
@@ -2128,17 +2243,23 @@ def _combat_continue_override(obj, args, ret, func):
 
 
 def _combat_entry_override(obj, args, ret, func):
-    """Permit sprint entry past only the offhand firing exclusion."""
+    """Override native sprint entry only for guarded local offhand firing.
+
+    A successful PRE override replaces the full native CanSprint result.
+    """
     if not (_active and _cfg_omni and _cfg_hip_fire and _active_fire_entry
-            and _combat_fire_mask and _is_local_pawn(obj)):
+            and (_combat_fire_mask or _combat_fire_tail) and _is_local_pawn(obj)):
         return
     pc = _pc()
-    if pc is None or pc.bInSprintState or not _combat_sprint_safe(pc, obj):
+    if pc is None or pc.bInSprintState or not _combat_sprint_safe(pc, obj, allow_offhand_reload=True):
         return
     try:
         if (obj.OffHandWeapon is None or pc.PlayerClass is None
                 or pc.PlayerClass.SprintSettings is None
                 or pc.bPerformingMeleeAttack or pc.bPerformingSharedWeaponAction):
+            return
+        if not _combat_fire_mask and not (
+                _combat_tail_matches(pc, obj) and obj.OffHandWeapon.IsFiring()):
             return
         return Block, True
     except Exception:
@@ -2146,10 +2267,79 @@ def _combat_entry_override(obj, args, ret, func):
 
 
 def _sync_combat_sprint_hooks():
-    enabled = bool(_active and _cfg_omni and (_combat_action_active or _combat_fire_mask))
+    firing = bool(_combat_fire_mask or _combat_fire_tail)
+    enabled = bool(_active and _cfg_omni and (_combat_action_active or firing))
     _set_hook("combat-continue", enabled, CONTINUE, Type.PRE, _combat_continue_override)
-    _set_hook("combat-entry", bool(enabled and _combat_fire_mask and _active_fire_entry),
+    _set_hook("combat-entry", bool(enabled and firing and _active_fire_entry),
               CAN_SPRINT, Type.PRE, _combat_entry_override)
+
+
+def _combat_tail_matches(pc, pawn):
+    """A released trigger may leave its exact offhand weapon firing briefly."""
+    try:
+        tail = _combat_fire_tail
+        return bool(tail and pc is not None and pawn is not None
+                    and pawn.OffHandWeapon is not None
+                    and (pc._get_address(), pawn._get_address(),
+                         pawn.OffHandWeapon._get_address()) == tail[:3]
+                    and time.perf_counter() < tail[4])
+    except Exception:
+        return False
+
+
+def _stop_combat_fire_tail():
+    global _combat_fire_tail
+    _combat_fire_tail = None
+    _set_hook("combat-fire-tail", False, PLAYER_TICK, Type.POST_UNCONDITIONAL,
+              _combat_fire_tail_tick)
+
+
+def _combat_fire_tail_tick(obj, args, ret, func):
+    """Retire the release override once native sprint continuation accepts."""
+    pc = _local_pc(obj)
+    if pc is None:
+        return  # A foreign controller tick cannot retire the local release.
+    pawn = pc.Pawn
+    try:
+        pending = bool(_active and _cfg_omni and _cfg_hip_fire
+                       and _combat_tail_matches(pc, pawn))
+        if pending and time.perf_counter() >= _combat_fire_tail[3]:
+            if pc.bInSprintState and _cfg_assist and _armed:
+                pending = (_combat_sprint_safe(pc, pawn, allow_offhand_reload=True, release=True,
+                            airborne_offhand=_airborne_offhand_continuation(pc, pawn))
+                           and _combat_release_safe(pc, pawn))
+                if pending:
+                    # Reflected IsFiring can report false before the native
+                    # gate clears. Probe the gate without our override.
+                    with unrealsdk.hooks.prevent_hooking_direct_calls():
+                        pending = not pawn.CanContinueSprinting()
+            else:
+                pending = bool(pawn.OffHandWeapon.IsFiring())
+    except Exception:
+        pending = False
+    if not pending:
+        _stop_combat_fire_tail()
+        _sync_combat_sprint_hooks()
+
+
+def _retain_combat_fire_tail(pc):
+    global _combat_fire_tail
+    try:
+        pawn = pc.Pawn
+        offhand = None if pawn is None else pawn.OffHandWeapon
+        if not (_active and _cfg_omni and _cfg_hip_fire and offhand is not None
+                and (pc.bInSprintState or offhand.IsFiring())):
+            return
+        # Live dual wield can reject the first continuation check after
+        # StopFire even when the exposed IsFiring() already reports false.
+        now = time.perf_counter()
+        _combat_fire_tail = (pc._get_address(), pawn._get_address(),
+                             offhand._get_address(), now + 0.10, now + 5.0)
+        if not _set_hook("combat-fire-tail", True, PLAYER_TICK,
+                         Type.POST_UNCONDITIONAL, _combat_fire_tail_tick):
+            _combat_fire_tail = None
+    except Exception:
+        _combat_fire_tail = None
 
 
 def _combat_action_begin(obj, args, ret, func):
@@ -2169,9 +2359,13 @@ def _combat_fire_edge(pc, mode, pressed):
         if not (_active and _cfg_omni and _cfg_hip_fire and pc.Pawn is not None
                 and pc.Pawn.OffHandWeapon is not None):
             return
+        _stop_combat_fire_tail()
         _combat_fire_mask |= bit
     else:
+        was_held = bool(_combat_fire_mask & bit)
         _combat_fire_mask &= ~bit
+        if was_held and not _combat_fire_mask:
+            _retain_combat_fire_tail(pc)
     _sync_combat_sprint_hooks()
     if pressed and _active_fire_entry and _cfg_assist and _armed and not pc.bInSprintState:
         _assist_recover_or_schedule(pc)
@@ -2192,6 +2386,13 @@ def _weapon_action_completed(obj, args, ret, func):
     _sync_combat_sprint_hooks()
     if _active and _cfg_assist and _armed and not pc.bInSprintState:
         _assist_recover_or_schedule(pc)
+
+
+def _weapon_action_pose_completed(obj, args, ret, func):
+    """Reacquire the firing pose after native melee/shared action cleanup."""
+    pc = _local_pc(obj)
+    if _active and _cfg_hip_fire and pc is not None and pc.bInSprintState:
+        _sprint_fire_entry(pc, after_equip=True)
 
 
 def _zero_execute_restore_momentum(pc, pi, pawn):
@@ -2380,6 +2581,523 @@ def _zero_execute_cleanup_completed(obj, args, ret, func):
         pass
 
 
+def _equip_sprint_owner(pc, weapon):
+    """Match the incoming weapon to the current local pawn and exact hand."""
+    if pc is None or weapon is None:
+        return None
+    pawn, pi = pc.Pawn, pc.PlayerInput
+    if pawn is None or pi is None or not _same(pawn.Controller, pc):
+        return None
+    if not _same(weapon.Instigator, pawn):
+        return None
+    if _same(weapon, pawn.Weapon):
+        hand = 0
+    elif _same(weapon, pawn.OffHandWeapon):
+        hand = 1
+    else:
+        return None
+    return (hand, pc._get_address(), pawn._get_address(), pi._get_address(), weapon._get_address())
+
+
+def _drop_sprint_pre(obj, args, ret, func):
+    global _drop_sprint_scope
+    if not (_active and _cfg_omni and _cfg_assist and _cfg_baseline and _armed):
+        return
+    try:
+        pc = _pc()
+        owner = _equip_sprint_owner(pc, obj)
+        if owner is not None and pc.bInSprintState:
+            now = time.perf_counter()
+            if _drop_sprint_scope is None or now >= _drop_sprint_scope[1]:
+                _drop_sprint_scope = (owner, now + 0.25)
+    except Exception:
+        pass
+
+
+def _drop_sprint_post(obj, args, ret, func):
+    global _drop_sprint_scope
+    if _drop_sprint_scope is not None and obj._get_address() == _drop_sprint_scope[0][4]:
+        _drop_sprint_scope = None
+
+
+def _sync_drop_sprint_hooks(enabled):
+    global _drop_sprint_scope
+    if enabled and _set_optional_hook("drop-sprint-post", True, WEAPON_DROP,
+                                     Type.POST_UNCONDITIONAL, _drop_sprint_post):
+        if _set_optional_hook("drop-sprint-pre", True, WEAPON_DROP, Type.PRE, _drop_sprint_pre):
+            return
+    _drop_sprint_scope = None
+    _set_hook("drop-sprint-pre", False, WEAPON_DROP, Type.PRE, _drop_sprint_pre)
+    _set_hook("drop-sprint-post", False, WEAPON_DROP, Type.POST_UNCONDITIONAL, _drop_sprint_post)
+
+
+def _equip_sprint_skid(pc):
+    try:
+        lurch = pc.CurrentLurch
+        return (float(lurch.StartTime), float(lurch.Duration),
+                float(lurch.LocMagnitude), float(lurch.RotMagnitude))
+    except Exception:
+        return None
+
+
+def _expire_equip_sprint_skid(pc, pending):
+    """Expire only a new, still-owned camera skid created by this equip."""
+    skid = pending.get("equip_skid")
+    if skid is None or skid != _equip_sprint_skid(pc):
+        return
+    try:
+        now = float(pc.WorldInfo.TimeSeconds)
+        if skid[1] > 0.0 and 0.0 <= now - skid[0] <= 0.10:
+            _action_skid.cancel(pc)
+            _schedule_action_skid_tick()
+    except Exception:
+        pass
+
+
+def _equip_sprint_bringup_pre(obj, args, ret, func):
+    if not (_active and _cfg_omni and _cfg_assist and "equip-sprint-post" in _hooks):
+        return
+    try:
+        pc = _pc()
+        owner = _equip_sprint_owner(pc, obj)
+        if owner is None:
+            return
+        hand = owner[0]
+        _equip_sprint_handoffs.pop(hand, None)
+        if _armed and pc.bInSprintState:
+            activation = (hand == 1
+                          and str(pc.PlayerInput.CurrentInputContextName) != "Gunzerking")
+            started = time.perf_counter()
+            _equip_sprint_handoffs[hand] = dict(
+                owner=owner, started=started, deadline=started + 0.25,
+                phase="bringup", attempts=0, activation=activation, context_before=None,
+                last_input=None, context_zero_until=0.0,
+                travel_owner=_equip_activation_travel_owner(pc, owner) if activation else None,
+                old_skid=_equip_sprint_skid(pc) if pc.Pawn.OffHandWeapon is not None else None)
+    except Exception:
+        return
+
+
+def _equip_sprint_bringup_post(obj, args, ret, func):
+    if not _equip_sprint_handoffs:
+        return
+    try:
+        pc = _pc()
+        owner = _equip_sprint_owner(pc, obj)
+        if owner is None:
+            return
+        pending = _equip_sprint_handoffs.get(owner[0])
+        if pending is None or pending["owner"] != owner or pending["phase"] != "bringup":
+            return
+        if pc.bInSprintState or time.perf_counter() >= pending["deadline"]:
+            _equip_sprint_handoffs.pop(owner[0], None)
+        else:
+            pending["phase"] = "ready"
+            old_skid = pending["old_skid"]
+            if old_skid is not None:
+                skid = _equip_sprint_skid(pc)
+                if skid is not None and skid != old_skid:
+                    pending["equip_skid"] = skid
+    except Exception:
+        return
+
+
+def _equip_activation_travel_owner(pc, owner):
+    """Treat already-sprinting, verified spawn settling separately from travel."""
+    if not _travel_pending:
+        return None
+    try:
+        generation = (owner[1], owner[3], owner[2])
+        # These bookkeeping flags may still be settling even when BL2 has
+        # already admitted a real local sprint in the destination. Verify the
+        # actual state, without changing the rest of travel recovery.
+        if (_travel_budget.active and _travel_generation == generation
+                and pc.IsLocalPlayerController() and pc.bInSprintState
+                and len(pc.SprintModifiers) > 0
+                and _assist_context(pc) and _equip_activation_world_loaded(pc)):
+            return (_travel_epoch, generation)
+    except Exception:
+        pass
+    return None
+
+
+def _equip_activation_world_loaded(pc):
+    world = pc.WorldInfo
+    return (world.Pauser is None and not world.IsPreparingMapChange()
+            and world.Game is not None and not world.Game.bLevelChange)
+
+
+def _equip_activation_world_ready(pc, *, settling=False):
+    if (_travel_modal_open or _crosshair_modal_open
+            or not _equip_activation_world_loaded(pc)):
+        return False
+    if not settling:
+        return not _travel_close_pending
+    # During the narrow destination exception, ask the live HUD. A stale
+    # close-settling bit is not proof of a modal, and a real blocker still wins.
+    pri, ui = pc.PlayerReplicationInfo, pc.GFxUIManager
+    return (pri is not None and not pri.bGFxMenuOpen
+            and ui is not None and not ui.IsBlockingMoviePlaying())
+
+
+def _equip_sprint_veto(pc, pawn, pi, now, pending):
+    """Return a specific blocker. Only unstable handoff state merits a retry."""
+    if not (_active and _cfg_omni and _cfg_assist and _armed):
+        return "disabled-or-walk"
+    if _travel_pending:
+        if (not _travel_budget.active or pending["travel_owner"] != (_travel_epoch, _travel_generation)
+                or not _equip_activation_world_loaded(pc)):
+            return "travel"
+        if not _equip_activation_world_ready(pc, settling=True):
+            return "destination-hud"
+    if pc.WorldInfo.Pauser is not None:
+        return "paused"
+    if _crosshair_modal_open:
+        return "modal-hud"
+    if pc.PlayerReplicationInfo is None:
+        return "missing-player-info"
+    if pc.PlayerReplicationInfo.bGFxMenuOpen:
+        return "gfx-menu"
+    if pawn.DrivenVehicle is not None or pawn.bDeleteMe:
+        return "not-on-foot"
+    physics = int(pawn.Physics)
+    if physics not in (1, 2):
+        return "not-on-foot"
+    if _assist_crouching(pc, pawn) or _crouch_sprint_paused():
+        return "crouch"
+    if (_deathtrap_skill_active or _zero_execute_waiting() or _knockback_until > now
+            or pawn.bForceRMVelocity or pawn.bForceRegularVelocity or pawn.bRMForceStop
+            or pc.bThrowingGrenade or pc.bPerformingMeleeAttack
+            or pc.bPerformingSharedWeaponAction):
+        return "action"
+    if _fast_zoomed(pc, pawn.Weapon):
+        return "ads"
+    if pawn.bReloading or _pose_reload_active(pawn):
+        return "reload"
+    if not _assist_raw_moving(pc, pi=pi):
+        return "no-movement"
+    if not _assist_context(pc, pi=pi, pawn=pawn):
+        return "input-context"
+    if physics == 2:
+        return "airborne"
+    if pc.bPressedJump:
+        return "jump-input"
+    # The native end path must remove the prior sprint's modifiers before
+    # DoSprint can safely apply a new set.
+    if len(pc.SprintModifiers):
+        return "sprint-modifiers"
+    return None
+
+
+def _stop_equip_sprint_frames():
+    _set_hook("equip-sprint-input", False, POST_PLAYER_INPUT, Type.POST, _equip_sprint_input_post)
+    _set_hook("equip-sprint-tick", False, PLAYER_TICK, Type.POST_UNCONDITIONAL, _equip_sprint_tick)
+
+
+def _clear_equip_sprint_handoffs():
+    global _drop_sprint_scope
+    _drop_sprint_scope = None
+    _equip_sprint_handoffs.clear()
+    _stop_equip_sprint_frames()
+
+
+def _watch_equip_sprint_frames():
+    input_hook = _set_optional_hook("equip-sprint-input", True, POST_PLAYER_INPUT, Type.POST,
+                                   _equip_sprint_input_post)
+    # A reflected input hook can register without being dispatched by the live
+    # game. PlayerTick also owns the deadline and provides a bounded fallback.
+    tick_hook = _set_hook("equip-sprint-tick", True, PLAYER_TICK, Type.POST_UNCONDITIONAL,
+                          _equip_sprint_tick)
+    return bool(input_hook or tick_hook)
+
+
+def _try_equip_sprint(pc, weapon, *, input_ready):
+    owner = _equip_sprint_owner(pc, weapon)
+    if owner is None:
+        return "owner"
+    hand = owner[0]
+    pending = _equip_sprint_handoffs.get(hand)
+    if pending is None or pending["owner"] != owner:
+        return "owner"
+    now = time.perf_counter()
+    if now >= pending["deadline"] or pending["attempts"] >= 3:
+        _equip_sprint_handoffs.pop(hand, None)
+        return "expired"
+    if pending["phase"] != "ready":
+        return pending["phase"]
+    if pc.bInSprintState:
+        _equip_sprint_handoffs.pop(hand, None)
+        return "already-sprinting"
+
+    pawn, pi = pc.Pawn, pc.PlayerInput
+    veto = _equip_sprint_veto(pc, pawn, pi, now, pending)
+    if veto is not None:
+        if veto == "destination-hud" and pending["activation"]:
+            # A HUD veto at equip entry can clear after the native menu
+            # handoff. Keep the exact destination retry and let the live
+            # HUD continue to veto it until it is actually ready.
+            pending["deadline"] = max(pending["deadline"], pending["started"] + 0.75)
+            return veto
+        if veto == "airborne" and pending["activation"]:
+            # Keep this exact activation intent until landing, without
+            # starting airborne sprint or replacing the velocity.
+            pending["deadline"] = pending["started"] + 1.25
+            return veto
+        if (veto not in ("sprint-modifiers", "input-context", "modal-hud", "jump-input",
+                         "missing-player-info", "gfx-menu")
+                and not (veto == "no-movement" and not input_ready)):
+            _equip_sprint_handoffs.pop(hand, None)
+        return veto
+    if _equip_sprint_owner(pc, weapon) != owner:
+        _equip_sprint_handoffs.pop(hand, None)
+        return "owner"
+    pending["attempts"] += 1
+    pending["phase"] = "calling"
+    pawn.DoSprint(False)
+    if _equip_sprint_handoffs.get(hand) is not pending:
+        return "superseded"
+    if pc.bInSprintState:
+        _expire_equip_sprint_skid(pc, pending)
+        if pending["activation"] and pending["attempts"] < 3:
+            pending["phase"] = "resumed"
+        else:
+            _equip_sprint_handoffs.pop(hand, None)
+        return "resumed"
+    if pending["attempts"] >= 3:
+        _equip_sprint_handoffs.pop(hand, None)
+    else:
+        pending["phase"] = "ready"
+    return "native-denied"
+
+
+def _resume_equip_sprint(weapon):
+    if not _equip_sprint_handoffs:
+        return False
+    try:
+        result = _try_equip_sprint(_pc(), weapon, input_ready=False)
+        if _equip_sprint_handoffs and not _watch_equip_sprint_frames():
+            _equip_sprint_handoffs.clear()
+        return result == "resumed"
+    except Exception:
+        _clear_equip_sprint_handoffs()
+        return False
+
+
+def _equip_sprint_frame(pc, *, input_hook=True):
+    if not (_active and _cfg_omni and _cfg_assist and _armed and pc is not None):
+        _clear_equip_sprint_handoffs()
+        return
+    try:
+        pawn, pi = pc.Pawn, pc.PlayerInput
+        if pawn is None or pi is None:
+            _clear_equip_sprint_handoffs()
+            return
+        now = time.perf_counter()
+        if not _assist_raw_moving(pc, pi=pi):
+            # Never retry on neutral input. A verified context change can
+            # clear one native sample before the held input is read again.
+            if input_hook:
+                for hand, pending in tuple(_equip_sprint_handoffs.items()):
+                    weapon = pawn.OffHandWeapon if hand == 1 else pawn.Weapon
+                    if (now < min(pending["context_zero_until"], pending["deadline"])
+                            and _equip_sprint_owner(pc, weapon) == pending["owner"]):
+                        pending["context_zero_until"] = -1.0
+                    else:
+                        _equip_sprint_handoffs.pop(hand, None)
+                if not _equip_sprint_handoffs:
+                    _stop_equip_sprint_frames()
+            elif not any(now < max(pending["started"] + 0.03, pending["context_zero_until"])
+                         for pending in _equip_sprint_handoffs.values()):
+                _clear_equip_sprint_handoffs()
+            return
+        for hand, pending in tuple(_equip_sprint_handoffs.items()):
+            weapon = pawn.Weapon if hand == 0 else pawn.OffHandWeapon
+            if (now >= pending["deadline"]
+                    or _equip_sprint_owner(pc, weapon) != pending["owner"]
+                    or (pending["phase"] == "resumed" and not pc.bInSprintState)):
+                _equip_sprint_handoffs.pop(hand, None)
+            elif pending["phase"] == "ready":
+                if input_hook:
+                    pending["last_input"] = now
+                    if pending["context_zero_until"] > 0.0:
+                        pending["context_zero_until"] = -1.0
+                elif ("equip-sprint-input" in _hooks
+                      and now - (pending["last_input"] or pending["started"]) < 0.03):
+                    continue
+                _try_equip_sprint(pc, weapon, input_ready=True)
+        if not _equip_sprint_handoffs:
+            _stop_equip_sprint_frames()
+    except Exception:
+        _clear_equip_sprint_handoffs()
+
+
+def _equip_sprint_input_post(obj, args, ret, func):
+    if _local_input(obj) is not None:
+        _equip_sprint_frame(_pc())
+
+
+def _equip_sprint_tick(obj, args, ret, func):
+    pc = _local_pc(obj)
+    if pc is not None:
+        _equip_sprint_frame(pc, input_hook=False)
+
+
+def _stop_activation_input_frame():
+    global _activation_input_frame
+    _activation_input_frame = None
+    _set_hook("activation-input-frame", False, INPUT_FRAME, Type.POST_UNCONDITIONAL,
+              _activation_gamepad_frame)
+
+
+def _activation_stick_aligned(native, physical):
+    if physical is None or len(physical) != 2:
+        return False
+    x, y = native
+    px, py = physical
+    n, p = math.hypot(x, y), math.hypot(px, py)
+    return (0.25 <= n <= 1.5 and 0.30 <= p <= 1.45
+            and x * px + y * py >= 0.92 * n * p)
+
+
+def _capture_activation_input(obj, args):
+    global _activation_input_frame
+    if not (_active and _cfg_omni and _cfg_assist and _armed):
+        return
+    try:
+        if str(args.NewContextName) != "Gunzerking" or str(obj.CurrentInputContextName) == "Gunzerking":
+            return
+        pi = _local_input(obj)
+        pc = None if pi is None else _pc()
+        if pc is None or pc.Pawn is None or pc.Pawn.OffHandWeapon is None or _travel_input.synthetic:
+            return
+        pending = _equip_sprint_handoffs.get(1)
+        if not (pc.bInSprintState or (pending is not None and pending["activation"])):
+            return
+        settling = bool(_travel_pending and _travel_budget.active and pending is not None
+                        and pending["travel_owner"] == (_travel_epoch, _travel_generation))
+        if ((_travel_pending and not settling)
+                or not _equip_activation_world_ready(pc, settling=settling)
+                or not _assist_context(pc, pi=pi)):
+            return
+        owner = (pc._get_address(), pc.Pawn._get_address(), pi._get_address())
+        native = (float(pi.aBaseY), float(pi.aStrafe))
+        physical = _travel_input.activation_stick_sample(pi)
+        if physical is None:
+            # Steam Input or ambiguous XInput slots can leave the independent
+            # sample unavailable even while the local engine sees a gamepad.
+            # Require both live native axes and the preceding native snapshot
+            # to agree before borrowing the snapshot for the context-drop frame.
+            # Capturing an engine sample does not write input. The writer
+            # still requires current focus and local gamepad mode, so a
+            # transient focus read at capture cannot discard a valid frame.
+            if not pi.bUsingGamepad:
+                return
+            raw = (float(pi.RawJoyUp), float(pi.RawJoyRight))
+            if (not _activation_stick_aligned(native, raw)
+                    or abs(math.hypot(*native) - math.hypot(*raw)) > 0.25):
+                return
+            native = raw
+        else:
+            if math.hypot(*native) <= 0.015:
+                native = (float(pi.RawJoyUp), float(pi.RawJoyRight))
+                if abs(math.hypot(*native) - math.hypot(*physical)) > 0.25:
+                    return
+            if not _activation_stick_aligned(native, physical):
+                return
+        if _set_optional_hook("activation-input-frame", True, INPUT_FRAME,
+                              Type.POST_UNCONDITIONAL, _activation_gamepad_frame):
+            _activation_input_frame = (owner, time.perf_counter() + 0.08, native, physical,
+                                       _travel_epoch if settling else None)
+    except Exception:
+        return
+
+
+def _activation_gamepad_frame(obj, args, ret, func):
+    pi = _local_input(obj)
+    if pi is None:
+        return
+    pending = _activation_input_frame
+    _stop_activation_input_frame()
+    if pending is None:
+        return
+    try:
+        pc = _pc()
+        if (not (_active and _cfg_omni and _cfg_assist and _armed) or pc is None
+                or pc.Pawn is None or time.perf_counter() >= pending[1]
+                or not _same(pc.PlayerInput, pi)
+                or (pc._get_address(), pc.Pawn._get_address(), pi._get_address()) != pending[0]
+                or str(pi.CurrentInputContextName) != "Gunzerking"
+                or (_travel_pending and (pending[4] != _travel_epoch or not _travel_budget.active))
+                or not _equip_activation_world_ready(pc, settling=_travel_pending)
+                or not _skill_assist_context(pc, pi=pi)):
+            return
+        physical = _travel_input.activation_stick_sample(pi)
+        if pending[3] is None:
+            # Recheck native gamepad ownership. A recovered independent
+            # sample can veto the fallback on a release or direction change.
+            allowed = (_travel_input.activation_gamepad_active(pi)
+                       and (physical is None or (
+                           _activation_stick_aligned(pending[2], physical)
+                           and abs(math.hypot(*pending[2]) - math.hypot(*physical)) <= 0.25)))
+        else:
+            allowed = (_activation_stick_aligned(pending[2], physical)
+                       and math.dist(pending[3], physical) <= 0.18)
+        if allowed:
+            _travel_input.bridge_activation_frame(pi, pending[2])
+            if _travel_input.synthetic:  # failed rollback, retry only cleanup
+                _stop_travel_input_handoff()
+    except Exception:
+        return
+
+
+def _equip_sprint_context_pre(obj, args, ret, func):
+    _capture_activation_input(obj, args)
+    pending = _equip_sprint_handoffs.get(1)
+    if pending is None or not pending["activation"]:
+        return
+    try:
+        pi = _local_input(obj)
+        pc = None if pi is None else _pc()
+        pending["context_before"] = None
+        if (pc is not None and (pending["phase"] == "ready"
+                                or (pending["phase"] == "resumed" and pc.bInSprintState))
+                and _equip_sprint_owner(pc, pc.Pawn.OffHandWeapon) == pending["owner"]
+                and _assist_raw_moving(pc, pi=pi)):
+            pending["context_before"] = str(pi.CurrentInputContextName)
+    except Exception:
+        pass
+
+
+def _equip_sprint_context_post(pc, pi):
+    pending = _equip_sprint_handoffs.get(1)
+    if pending is None:
+        return
+    try:
+        before = pending["context_before"]
+        pending["context_before"] = None
+        if (before is None or before == "Gunzerking"
+                or str(pi.CurrentInputContextName) != "Gunzerking"
+                or pc is None
+                or _equip_sprint_owner(pc, pc.Pawn.OffHandWeapon) != pending["owner"]):
+            return
+        if pending["context_zero_until"] == 0.0:
+            # SetInputContext was seen clearing one native input frame in
+            # the live trace. Never resume on zero input, but don't discard
+            # this verified retry until the next actual input sample.
+            pending["context_zero_until"] = time.perf_counter() + 0.04
+        if pending["phase"] != "resumed":
+            return
+        if pc.bInSprintState:
+            _equip_sprint_handoffs.pop(1, None)
+            return
+        # Verified second interruption, bracketed by the exact local context call.
+        pending["activation"] = False
+        pending["phase"] = "ready"
+        _try_equip_sprint(pc, pc.Pawn.OffHandWeapon, input_ready=False)
+    except Exception:
+        _equip_sprint_handoffs.pop(1, None)
+
+
 def _weapon_transition_begin(obj, args, ret, func):
     if not _active or not _weapon_belongs_to_local(obj):
         return
@@ -2387,10 +3105,86 @@ def _weapon_transition_begin(obj, args, ret, func):
     _weapon_transition_refs[obj._get_address()] = unrealsdk.unreal.WeakPointer(obj)
     _clear_direction()
     if _cfg_crosshair:
-        _release_crosshair_visibility()
+        _release_swapping_reticle(obj)
     pi = None if _pi_ref is None else _pi_ref()
     if pi is not None and _cfg_assist:
-        _set_try_sprint(pi, False)
+        if not (_cfg_omni and _armed) or _fire_requested:
+            _set_try_sprint(pi, False)
+        elif not pi.bTryToSprint:
+            # Keep a stationary request queued across swaps. If BL2 already
+            # consumed it, the ordinary recovery tick can retry mid-swap.
+            pc = _pc()
+            if pc is not None and not pc.bInSprintState:
+                _schedule_assist_recovery(pc)
+
+
+def _weapon_equip_begin(obj, args, ret, func):
+    _weapon_transition_begin(obj, args, ret, func)
+    _resume_equip_sprint(obj)
+
+
+def _weapon_equip_end(obj, args, ret, func):
+    _weapon_transition_end(obj, args, ret, func)
+    if not (_active and _cfg_hip_fire):
+        return
+    pc = _pc()
+    if pc is not None and pc.bInSprintState and _equip_sprint_owner(pc, obj) is not None:
+        _sprint_fire_entry(pc, after_equip=True)
+
+
+def _offhand_equip_pending_fire(obj, args, ret, func):
+    """Reconcile only the incoming offhand queue before Active consumes it."""
+    _mainhand_equip_pending_fire(obj, args)
+    if not (_active and _cfg_hip_fire and not _crosshair_modal_open and not _travel_modal_open):
+        return
+    try:
+        if str(args.NextStateName) != "Active":
+            return
+        pc = _pc()
+        owner = _equip_sprint_owner(pc, obj)
+        if owner is None or owner[0] != 1 or not obj.bOffHand:
+            return
+        pawn = pc.Pawn
+        if (str(pc.PlayerInput.CurrentInputContextName) != "Gunzerking"
+                or not _basic_context(pc, pawn=pawn, fire_pose_only=True)
+                or int(obj.Role) != 3 or pc.WorldInfo.Pauser is not None
+                or pc.PlayerReplicationInfo is None or pc.PlayerReplicationInfo.bGFxMenuOpen
+                or obj.GetPendingFireLength() <= 0):
+            return
+        held = (_fire_requested and not pc.bStartFireZeroBeforeGunzerking
+                if pc.bGunzerkingAutoSwitch else _pose_offhand_requested)
+        pending = bool(obj.PendingFire(0))
+        if not held and pending:
+            obj.ClearPendingFire(0)
+        elif held and not pending and not pawn.bNoWeaponFiring and not obj.bWeaponPutDown:
+            obj.SetPendingFire(0)
+    except Exception:
+        return
+
+
+def _mainhand_equip_pending_fire(obj, args):
+    """Queue a held main-hand trigger on its locally owned incoming weapon."""
+    if not (_active and _cfg_hip_fire and not _crosshair_modal_open and not _travel_modal_open):
+        return
+    try:
+        if str(args.NextStateName) != "Active":
+            return
+        pc = _pc()
+        owner = _equip_sprint_owner(pc, obj)
+        if owner is None or owner[0] != 0 or obj.bOffHand:
+            return
+        pawn = pc.Pawn
+        if (not _basic_context(pc, pawn=pawn, fire_pose_only=True)
+                or int(obj.Role) != 3 or pc.WorldInfo.Pauser is not None
+                or pc.PlayerReplicationInfo is None or pc.PlayerReplicationInfo.bGFxMenuOpen
+                or obj.GetPendingFireLength() <= 0):
+            return
+        dual = pawn.OffHandWeapon is not None and str(pc.PlayerInput.CurrentInputContextName) == "Gunzerking"
+        held = _pose_offhand_requested if dual and pc.bGunzerkingAutoSwitch else _fire_requested
+        if held and not obj.PendingFire(0) and not pawn.bNoWeaponFiring and not obj.bWeaponPutDown:
+            obj.SetPendingFire(0)
+    except Exception:
+        return
 
 
 def _weapon_transition_end(obj, args, ret, func):
@@ -2430,9 +3224,8 @@ def _weapon_transition_end(obj, args, ret, func):
     if _active and _cfg_crosshair:
         pc = _pc()
         if pc is not None and pc.bInSprintState:
-            # Keep only a live widget associated with this weapon/current movie.
-            # Drop-reload or HUD replacement still falls back to a fresh search.
             _schedule_crosshair_resync(pc, ticks=24, preserve_widget=True)
+            _schedule_offhand_crosshair(pc)
 
 
 def _install_weapon_state_hooks():
@@ -2448,7 +3241,9 @@ def _install_weapon_state_hooks():
                 end_count += 1
             continue
 
-        callback = _weapon_transition_begin if is_begin else _weapon_transition_end
+        callback = (_weapon_equip_begin if tag == "equip-begin" else
+                    _weapon_equip_end if tag == "equip-end" else
+                    _weapon_transition_begin if is_begin else _weapon_transition_end)
         installed = False
         for path in candidates:
             if _set_optional_hook(
@@ -2467,6 +3262,22 @@ def _install_weapon_state_hooks():
             else:
                 end_count += 1
 
+    equip_end = _hooks.get("weapon-equip-end")
+    if equip_end is not None and _cfg_hip_fire:
+        _set_optional_hook("offhand-equip-fire", True, equip_end[0], Type.PRE,
+                           _offhand_equip_pending_fire)
+    else:
+        _set_hook("offhand-equip-fire", False, "", Type.PRE, _offhand_equip_pending_fire)
+    if "weapon-equip-begin" in _hooks:
+        post = _set_optional_hook("equip-sprint-post", True, WEAPON_BRINGUP,
+                                  Type.POST, _equip_sprint_bringup_post)
+        if post:
+            _set_optional_hook("equip-sprint-pre", True, WEAPON_BRINGUP,
+                               Type.PRE, _equip_sprint_bringup_pre)
+            _set_optional_hook("equip-sprint-context-pre", True, SET_INPUT_CONTEXT,
+                               Type.PRE, _equip_sprint_context_pre)
+    _sync_drop_sprint_hooks(_cfg_omni and _cfg_assist and "weapon-accuracy" in _hooks
+                            and "equip-sprint-pre" in _hooks and "equip-sprint-post" in _hooks)
     _weapon_state_events_complete = begin_count == 2 and end_count == 2
     if not _weapon_state_events_complete:
         pass
@@ -2474,8 +3285,17 @@ def _install_weapon_state_hooks():
 
 def _remove_weapon_state_hooks():
     global _weapon_state_events_complete
+    _clear_equip_sprint_handoffs()
+    _set_hook("offhand-equip-fire", False, "", Type.PRE, _offhand_equip_pending_fire)
+    _sync_drop_sprint_hooks(False)
+    _set_hook("equip-sprint-context-pre", False, SET_INPUT_CONTEXT,
+              Type.PRE, _equip_sprint_context_pre)
+    _set_hook("equip-sprint-pre", False, WEAPON_BRINGUP, Type.PRE, _equip_sprint_bringup_pre)
+    _set_hook("equip-sprint-post", False, WEAPON_BRINGUP, Type.POST, _equip_sprint_bringup_post)
     for tag, candidates, is_begin in WEAPON_STATE_PATHS:
-        callback = _weapon_transition_begin if is_begin else _weapon_transition_end
+        callback = (_weapon_equip_begin if tag == "equip-begin" else
+                    _weapon_equip_end if tag == "equip-end" else
+                    _weapon_transition_begin if is_begin else _weapon_transition_end)
         current = _hooks.get("weapon-" + tag)
         if current is not None:
             _set_hook(
@@ -2720,7 +3540,7 @@ def _fire_pose_eligible(pc, pawn, weapon, *, interrupted, zoomed):
         and not pc.bPendingZoom
         and not pawn.bIsCrouched
         and not pawn.bWantsToCrouch
-        and not _pose_reload_active(pawn)
+        and (not _pose_reload_active(pawn) or _opposite_hand_fire_during_reload(pc, pawn))
         and not pawn.bIsInjured
         and not pawn.bIsDead
         and not pawn.bForceRMVelocity
@@ -2732,6 +3552,25 @@ def _fire_pose_eligible(pc, pawn, weapon, *, interrupted, zoomed):
     )
 
 
+def _ready_gunzerk_hand_can_fire_during_swap(pc, pawn):
+    """One hand's equip must not suppress the other hand's firing pose."""
+    try:
+        main, offhand = pawn.Weapon, pawn.OffHandWeapon
+        if (main is None or offhand is None or not _combat_fire_mask
+                or str(pc.PlayerInput.CurrentInputContextName) != "Gunzerking"
+                or pc.bThrowingGrenade or pc.bPerformingMeleeAttack
+                or pc.bPerformingSharedWeaponAction):
+            return False
+        main_ready = _crosshair_weapon_ready(main)
+        offhand_ready = _crosshair_weapon_ready(offhand)
+        if main_ready == offhand_ready:
+            return False
+        offhand_bit = 1 if pc.bGunzerkingAutoSwitch else 2
+        return bool(_combat_fire_mask & (offhand_bit if offhand_ready else 3 ^ offhand_bit))
+    except Exception:
+        return False
+
+
 def _update_fire_pose(pc, *, firing, now, interrupted=None, zoomed=None):
     pawn = pc.Pawn
     weapon = None if pawn is None else pawn.Weapon
@@ -2740,6 +3579,8 @@ def _update_fire_pose(pc, *, firing, now, interrupted=None, zoomed=None):
         return
     if interrupted is None:
         interrupted = _interrupted(pc)
+    if interrupted and firing and _ready_gunzerk_hand_can_fire_during_swap(pc, pawn):
+        interrupted = False
     if zoomed is None:
         zoomed = _fast_zoomed(pc, weapon)
     eligible = _fire_pose_eligible(
@@ -2759,12 +3600,16 @@ def _pose_reload_retry_tick(obj, args, ret, func):
     global _pose_reload_retry
     pc = _local_pc(obj)
     if (pc is None or not _active or not _cfg_hip_fire or not pc.bInSprintState
-            or not _pose_fire_requested() or _pose_reload_addresses or _pose_reload_retry <= 0):
+            or not _pose_fire_requested() or _pose_reload_retry <= 0):
+        _stop_pose_reload_retry()
+        return
+    pawn = pc.Pawn
+    other_hand = pawn is not None and _opposite_hand_fire_during_reload(pc, pawn)
+    if _pose_reload_addresses and not other_hand:
         _stop_pose_reload_retry()
         return
     _pose_reload_retry -= 1
-    pawn = pc.Pawn
-    if pawn is not None and not pawn.bReloading:
+    if pawn is not None and (not pawn.bReloading or other_hand):
         _update_fire_pose(pc, firing=True, now=float(pc.WorldInfo.TimeSeconds))
         if _fire_pose.aliases_active:
             _stop_pose_reload_retry()
@@ -2777,11 +3622,21 @@ def _pose_reload_begin(obj, args, ret, func):
         return
     _pose_reload_addresses.add(obj._get_address())
     _stop_pose_reload_retry()
+    pc = _pc()
+    if pc is not None and pc.bInSprintState and _opposite_hand_fire_during_reload(pc, pc.Pawn):
+        _update_fire_pose(pc, firing=True, now=float(pc.WorldInfo.TimeSeconds))
+        return
     _fire_pose.restore()
 
 
-def _pose_reload_end(obj, args, ret, func):
+def _pose_reload_end_retry():
     global _pose_reload_retry
+    _pose_reload_retry = 60
+    _set_hook("pose-reload-retry", True, PLAYER_TICK, Type.POST_UNCONDITIONAL,
+              _pose_reload_retry_tick)
+
+
+def _pose_reload_end(obj, args, ret, func):
     try:
         address = obj._get_address()
     except Exception:
@@ -2789,11 +3644,12 @@ def _pose_reload_end(obj, args, ret, func):
     if address not in _pose_reload_addresses:
         return
     _pose_reload_addresses.discard(address)
-    if not (_active and _cfg_hip_fire and not _pose_reload_addresses and _pose_fire_requested()):
+    pc = _pc()
+    if not (_active and _cfg_hip_fire and _pose_fire_requested()
+            and (not _pose_reload_addresses or (pc is not None and pc.Pawn is not None
+                 and _opposite_hand_fire_during_reload(pc, pc.Pawn)))):
         return
-    _pose_reload_retry = 60
-    _set_hook("pose-reload-retry", True, PLAYER_TICK, Type.POST_UNCONDITIONAL,
-              _pose_reload_retry_tick)
+    _pose_reload_end_retry()
 
 
 def _pose_fire_requested():
@@ -2815,7 +3671,9 @@ def _hip_cleanup_tick(obj, args, ret, func):
     """Short-lived cleanup tick used only after hip-fire release."""
     global _pose_release_at
     pc = _local_pc(obj)
-    if pc is None or not (_active and _cfg_hip_fire and pc.bInSprintState):
+    if pc is None:
+        return
+    if not (_active and _cfg_hip_fire and pc.bInSprintState):
         _fire_pose.restore()
         _sync_fire_hooks(False)
         return
@@ -2892,7 +3750,11 @@ def _get_crosshair_widget(pc, *, retry_interval=0.5):
         and widget is not None
         and _same(widget.MyHUDMovie, movie)
     ):
-        return widget
+        primary = getattr(movie, "CrosshairWidget", None)
+        if primary is None or _same(primary, widget):
+            return widget
+        _crosshair_widget = None
+        _crosshair_retry_at = 0.0
 
     if movie_address != _crosshair_movie_address:
         _crosshair_widget = None
@@ -2936,7 +3798,8 @@ def _owned_crosshair_widget(movie):
 def _find_crosshair_widget(movie):
     """Cold fallback; measure the iteration, not just creation of an iterable."""
     for candidate in unrealsdk.find_all("WillowGame.HUDWidget_Crosshairs"):
-        if _same(candidate.MyHUDMovie, movie):
+        if (_same(candidate.MyHUDMovie, movie)
+                and not candidate.bScopeCrosshair and not candidate.bDualWieldCrosshair):
             return candidate
     return None
 
@@ -2973,11 +3836,248 @@ def _crosshair_eligible(pc, weapon=None, *, hud=None):
     )
 
 
+def _crosshair_weapon_ready(weapon):
+    try:
+        # HUD readiness follows native per-weapon state. A missed EndState
+        # must not leave a reticle permanently hidden behind the assist ledger.
+        return (weapon is not None and not weapon.bWeaponPutDown and not weapon.IsEquipping()
+                and not weapon.IsPuttingDown())
+    except Exception:
+        return False
+
+
+def _right_crosshair_ready(pc, widget):
+    if not _crosshair_widget_ready(pc, widget) or not _crosshair_weapon_ready(pc.Pawn.Weapon):
+        return False
+    try:
+        primary = pc.myHUD.HUDMovie.CrosshairWidget
+    except AttributeError:
+        primary = None
+    return primary is None or _same(primary, widget)
+
+
+def _hide_weapon_crosshair(widget):
+    with unrealsdk.hooks.prevent_hooking_direct_calls():
+        if int(widget.CrosshairVisibility) != 0:
+            widget.SetCrosshairVisibility(bVisible=False)
+        widget.OuterClip.SetVisible(False)
+    widget.CrosshairVisibility = 0
+
+
+def _offhand_crosshair_matches(pc, widget, *, require_clips=True):
+    try:
+        pawn, hud = pc.Pawn, pc.myHUD
+        weapon = pawn.OffHandWeapon
+        return bool(weapon is not None and hud is not None and hud.HUDMovie is not None
+                    and widget.bDualWieldCrosshair and not widget.bScopeCrosshair
+                    and _same(widget.MyHUDMovie, hud.HUDMovie) and _same(widget.WWeap, weapon)
+                    and (not require_clips
+                         or (widget.OuterClip is not None and widget.InnerClip is not None)))
+    except Exception:
+        return False
+
+
+def _offhand_crosshair_eligible(pc, widget):
+    return (_offhand_crosshair_matches(pc, widget)
+            and _crosshair_eligible(pc, pc.Pawn.OffHandWeapon)
+            and _crosshair_weapon_ready(pc.Pawn.OffHandWeapon)
+            and not _fast_zoomed(pc, pc.Pawn.Weapon))
+
+
+def _release_offhand_crosshair(*, refresh_native=True):
+    global _offhand_crosshair
+    owned, _offhand_crosshair = _offhand_crosshair, None
+    if owned is None:
+        return
+    try:
+        widget = owned[0]()
+        if widget is None:
+            return
+        _hide_weapon_crosshair(widget)
+        widget.InnerClip.SetVisible(owned[1])
+        pc = _pc()
+        if refresh_native and pc is not None and _offhand_crosshair_matches(pc, widget):
+            with unrealsdk.hooks.prevent_hooking_direct_calls():
+                widget.Update(0.0)
+    except Exception:
+        pass
+
+
+def _release_swapping_reticle(weapon):
+    """Hide only the reticle owned for the weapon entering a transition."""
+    try:
+        right = None if _crosshair_forced_widget is None else _crosshair_forced_widget()
+        if right is not None and _same(right.WWeap, weapon):
+            _release_crosshair_visibility(refresh_native=False, include_offhand=False)
+        left = None if _offhand_crosshair is None else _offhand_crosshair[0]()
+        if left is not None and _same(left.WWeap, weapon):
+            _release_offhand_crosshair(refresh_native=False)
+    except Exception:
+        pass
+
+
+def _select_offhand_crosshair(pc, widgets, updated=()):
+    matches = [widget for widget in widgets if _offhand_crosshair_matches(pc, widget)]
+    if len(matches) == 1:
+        return matches[0]
+    # A visible native widget, or equivalent wrappers for the same visible
+    # clip, distinguishes the live presentation from a stale association.
+    visible = [widget for widget in matches if int(widget.CrosshairVisibility) == 1
+               and bool(widget.OuterClip.GetBool("_visible"))]
+    if len(visible) == 1:
+        return visible[0]
+    live = [widget for widget in matches if widget._get_address() in updated]
+    if len(live) == 1:
+        return live[0]
+    if matches and all(_same(matches[0].OuterClip, widget.OuterClip) for widget in matches[1:]):
+        return matches[0]
+    return None
+
+
+def _show_offhand_crosshair(pc, widget):
+    global _offhand_crosshair
+    if not _offhand_crosshair_eligible(pc, widget):
+        return False
+    owned = None if _offhand_crosshair is None else _offhand_crosshair[0]()
+    if owned is not None and _same(owned, widget):
+        return True
+    _release_offhand_crosshair(refresh_native=False)
+    try:
+        _offhand_crosshair = (unrealsdk.unreal.WeakPointer(widget),
+                              bool(widget.InnerClip.GetBool("_visible")))
+        with unrealsdk.hooks.prevent_hooking_direct_calls():
+            widget.UpdateCrosshairFrame()
+            widget.SetCrosshairVisibility(bVisible=True)
+            widget.OuterClip.SetVisible(True)
+            widget.InnerClip.SetVisible(True)
+        widget.CrosshairVisibility = 0
+        return True
+    except Exception:
+        _release_offhand_crosshair(refresh_native=False)
+        return False
+
+
+def _offhand_crosshair_visibility(pc, widget, args):
+    owned = None if _offhand_crosshair is None else _offhand_crosshair[0]()
+    try:
+        if not _offhand_crosshair_eligible(pc, widget):
+            if owned is not None and _same(owned, widget):
+                _release_offhand_crosshair(refresh_native=False)
+            if (_offhand_crosshair_matches(pc, widget)
+                    and _crosshair_eligible(pc, pc.Pawn.OffHandWeapon)
+                    and not _fast_zoomed(pc, pc.Pawn.Weapon)
+                    and not _crosshair_weapon_ready(pc.Pawn.OffHandWeapon)):
+                _hide_weapon_crosshair(widget)
+                return Block
+            return
+        if owned is not None and _same(owned, widget):
+            widget.CrosshairVisibility = 0
+            return Block
+        # A real native show, or a hide of a visible widget, identifies the
+        # live widget when more than one cached association matches the gun.
+        if owned is None and (bool(args.bVisible) or int(widget.CrosshairVisibility) == 1):
+            if _show_offhand_crosshair(pc, widget):
+                return Block
+    except Exception:
+        return
+
+
+def _offhand_crosshair_update(obj, args, ret, func):
+    # Only installed during a bounded retry. Association alone is ambiguous
+    # when a stale copy of the same weapon's widget is also in this movie.
+    if _offhand_crosshair_retry is None or _offhand_crosshair is not None:
+        return
+    try:
+        pc = _pc()
+        if _offhand_crosshair_matches(pc, obj):
+            _offhand_native_updates[obj._get_address()] = unrealsdk.unreal.WeakPointer(obj)
+    except Exception:
+        pass
+
+
+def _stop_offhand_crosshair_retry():
+    global _offhand_crosshair_retry, _offhand_associated_widget
+    _offhand_crosshair_retry = None
+    _offhand_associated_widget = None
+    _offhand_native_updates.clear()
+    _set_hook("offhand-crosshair-update", False, CROSSHAIR_UPDATE, Type.POST,
+              _offhand_crosshair_update)
+    _set_hook("offhand-crosshair-retry", False, PLAYER_TICK, Type.POST_UNCONDITIONAL,
+              _offhand_crosshair_tick)
+
+
+def _schedule_offhand_crosshair(pc, *, pending_draw=False):
+    global _offhand_crosshair_retry
+    if not (_active and _cfg_crosshair and pc is not None and pc.Pawn is not None
+            and (pending_draw or pc.Pawn.OffHandWeapon is not None)):
+        return
+    now = time.perf_counter()
+    owner = pc._get_address(), pc.Pawn._get_address()
+    pending = _offhand_crosshair_retry
+    if pending is not None and pending[0] == owner and now < pending[1]:
+        return
+    _offhand_native_updates.clear()
+    _offhand_crosshair_retry = (owner, now + 3.0, now)
+    if not _set_hook("offhand-crosshair-retry", True, PLAYER_TICK, Type.POST_UNCONDITIONAL,
+                     _offhand_crosshair_tick):
+        _offhand_crosshair_retry = None
+        return
+    _set_optional_hook("offhand-crosshair-update", True, CROSSHAIR_UPDATE, Type.POST,
+                       _offhand_crosshair_update)
+
+
+def _offhand_crosshair_tick(obj, args, ret, func):
+    global _offhand_crosshair_retry
+    pc = _local_pc(obj)
+    if pc is None:
+        return
+    try:
+        pending = _offhand_crosshair_retry
+        now = time.perf_counter()
+        if (pending is None or not (_active and _cfg_crosshair) or pc.Pawn is None
+                or pending[0] != (pc._get_address(), pc.Pawn._get_address())
+                or now >= pending[1] or _crosshair_modal_open):
+            _stop_offhand_crosshair_retry()
+            return
+        if now < pending[2]:
+            return
+        _offhand_crosshair_retry = (pending[0], pending[1], now + 0.10)
+        owned = None if _offhand_crosshair is None else _offhand_crosshair[0]()
+        associated = None if _offhand_associated_widget is None else _offhand_associated_widget()
+        if (associated is not None and not _same(owned, associated)
+                and _offhand_crosshair_matches(pc, associated, require_clips=False)):
+            _show_offhand_crosshair(pc, associated)
+            return
+        if owned is not None and _offhand_crosshair_eligible(pc, owned):
+            # A native HUD rebuild can hide the clip without changing WWeap.
+            if not (owned.OuterClip.GetBool("_visible") and owned.InnerClip.GetBool("_visible")):
+                with unrealsdk.hooks.prevent_hooking_direct_calls():
+                    owned.OuterClip.SetVisible(True)
+                    owned.InnerClip.SetVisible(True)
+                owned.CrosshairVisibility = 0
+            return
+        _release_offhand_crosshair()
+        weapon = pc.Pawn.OffHandWeapon
+        if (not pc.bInSprintState or not _crosshair_weapon_ready(weapon)
+                or not _crosshair_eligible(pc, weapon)):
+            return
+        updated = {address for address, ref in _offhand_native_updates.items()
+                   if _offhand_crosshair_matches(pc, ref())}
+        _offhand_native_updates.clear()
+        widget = _select_offhand_crosshair(
+            pc, unrealsdk.find_all("WillowGame.HUDWidget_Crosshairs"), updated)
+        if widget is not None:
+            _show_offhand_crosshair(pc, widget)
+    except Exception:
+        _stop_offhand_crosshair_retry()
+
+
+
 def _take_crosshair_ownership(widget, *, keep_cache_hidden=True):
     global _crosshair_forced_widget, _crosshair_inner_visible
     owned = None if _crosshair_forced_widget is None else _crosshair_forced_widget()
     if owned is not None and not _same(owned, widget):
-        _release_crosshair_visibility()
+        _release_crosshair_visibility(include_offhand=False)
         owned = None
 
     if owned is None:
@@ -2988,6 +4088,7 @@ def _take_crosshair_ownership(widget, *, keep_cache_hidden=True):
         _crosshair_forced_widget = unrealsdk.unreal.WeakPointer(widget)
         try:
             with unrealsdk.hooks.prevent_hooking_direct_calls():
+                widget.UpdateCrosshairFrame()
                 widget.SetCrosshairVisibility(bVisible=True)
             widget.OuterClip.SetVisible(True)
             widget.InnerClip.SetVisible(True)
@@ -2998,7 +4099,7 @@ def _take_crosshair_ownership(widget, *, keep_cache_hidden=True):
             if keep_cache_hidden:
                 widget.CrosshairVisibility = 0
         except Exception:
-            _release_crosshair_visibility()
+            _release_crosshair_visibility(include_offhand=False)
             raise
         return True
     return False
@@ -3007,31 +4108,38 @@ def _take_crosshair_ownership(widget, *, keep_cache_hidden=True):
 def _ensure_crosshair_visible(pc, widget=None, *, force_clips=False):
     global _crosshair_failure_logged
     if not _crosshair_eligible(pc):
-        _release_crosshair_visibility()
-        return
+        _release_crosshair_visibility(include_offhand=False)
+        return False
 
     if widget is None:
         widget = _get_crosshair_widget(pc)
     if widget is None or bool(widget.bScopeCrosshair) or bool(widget.bDualWieldCrosshair):
-        _release_crosshair_visibility()
-        return
+        _release_crosshair_visibility(include_offhand=False)
+        return False
 
+    if not _right_crosshair_ready(pc, widget):
+        _release_crosshair_visibility(refresh_native=False, include_offhand=False)
+        return False
     try:
         _take_crosshair_ownership(widget)
         if force_clips:
             widget.OuterClip.SetVisible(True)
             widget.InnerClip.SetVisible(True)
             widget.CrosshairVisibility = 0
+        return True
     except Exception as exc:
-        _release_crosshair_visibility()
+        _release_crosshair_visibility(include_offhand=False)
         _clear_crosshair_widget()
         if not _crosshair_failure_logged:
             logging.warning("omnimovement: sprint reticle update failed: " + repr(exc))
             _crosshair_failure_logged = True
+        return False
 
 
-def _release_crosshair_visibility():
+def _release_crosshair_visibility(*, refresh_native=True, include_offhand=True):
     global _crosshair_forced_widget, _crosshair_inner_visible
+    if include_offhand:
+        _release_offhand_crosshair(refresh_native=refresh_native)
     widget = None if _crosshair_forced_widget is None else _crosshair_forced_widget()
     inner_visible = _crosshair_inner_visible
     _crosshair_forced_widget = None
@@ -3048,7 +4156,8 @@ def _release_crosshair_visibility():
         if inner_visible is not None:
             widget.InnerClip.SetVisible(inner_visible)
         if (
-            pc is not None
+            refresh_native and pc is not None
+            and _right_crosshair_ready(pc, widget)
             and pc.myHUD is not None
             and _same(widget.MyHUDMovie, pc.myHUD.HUDMovie)
         ):
@@ -3067,6 +4176,9 @@ def _crosshair_visibility_pre(obj, args, ret, func):
     if hud is None or not _same(obj.MyHUDMovie, hud.HUDMovie):
         return
 
+    if bool(obj.bDualWieldCrosshair):
+        return _offhand_crosshair_visibility(pc, obj, args)
+
     # While eligible, the real clips are already visible but the native cache is
     # intentionally kept at Hidden. This prevents HUD Update from repeatedly
     # requesting the same sprint-hide transition. Block both True and False
@@ -3074,7 +4186,7 @@ def _crosshair_visibility_pre(obj, args, ret, func):
     eligible = _crosshair_eligible(pc, hud=hud)
     if eligible:
         try:
-            eligible = not bool(obj.bScopeCrosshair) and not bool(obj.bDualWieldCrosshair)
+            eligible = not bool(obj.bScopeCrosshair) and _right_crosshair_ready(pc, obj)
         except Exception:
             eligible = False
 
@@ -3090,11 +4202,20 @@ def _crosshair_visibility_pre(obj, args, ret, func):
             return Block
         except Exception as exc:
             global _crosshair_failure_logged
-            _release_crosshair_visibility()
+            _release_crosshair_visibility(include_offhand=False)
             _clear_crosshair_widget()
             if not _crosshair_failure_logged:
                 logging.warning("omnimovement: sprint reticle event failed: " + repr(exc))
                 _crosshair_failure_logged = True
+            return
+
+    if (_crosshair_eligible(pc, hud=hud) and not obj.bScopeCrosshair
+            and _same(obj, hud.HUDMovie.CrosshairWidget)
+            and not _right_crosshair_ready(pc, obj)):
+        try:
+            _hide_weapon_crosshair(obj)
+            return Block
+        except Exception:
             return
 
     # ADS/scope or loss of sprint legitimately returns visibility ownership to
@@ -3102,7 +4223,7 @@ def _crosshair_visibility_pre(obj, args, ret, func):
     # sprint remains active and is repaired by transition events.
     owned = None if _crosshair_forced_widget is None else _crosshair_forced_widget()
     if owned is not None and _same(owned, obj):
-        _release_crosshair_visibility()
+        _release_crosshair_visibility(include_offhand=False)
 
 
 def _crosshair_tick_fallback(obj, args, ret, func):
@@ -3189,7 +4310,7 @@ def _refresh_crosshair_native_presentation(pc, widget):
         return False
 
 
-def _reassert_crosshair_visible(pc, widget=None, *, finalize_cache=True, require_ready=False, retry_interval=0.5):
+def _reassert_crosshair_visible(pc, widget=None, *, finalize_cache=True, retry_interval=0.5):
     """Rare transition repair which re-runs BL2's native visibility setter.
 
     During pause restoration the visibility cache stays truthful for several HUD
@@ -3203,7 +4324,7 @@ def _reassert_crosshair_visible(pc, widget=None, *, finalize_cache=True, require
         widget = _get_crosshair_widget(pc, retry_interval=retry_interval)
     if widget is None or bool(widget.bScopeCrosshair) or bool(widget.bDualWieldCrosshair):
         return False
-    if require_ready and not _crosshair_widget_ready(pc, widget):
+    if not _right_crosshair_ready(pc, widget):
         return False
     try:
         if _take_crosshair_ownership(widget, keep_cache_hidden=finalize_cache):
@@ -3325,7 +4446,6 @@ def _schedule_crosshair_resync(
     if not defer_first and _reassert_crosshair_visible(
         pc, widget if request is not None else None,
         finalize_cache=not _crosshair_resync_truthful_cache,
-        require_ready=_crosshair_resync_truthful_cache,
         retry_interval=0.05 if _crosshair_resync_force_tick else 0.5,
     ):
         _crosshair_resync_last_request = request
@@ -3373,10 +4493,9 @@ def _crosshair_resync_update(obj, args, ret, func):
     ):
         _stop_crosshair_resync()
         return
-    if not _same(obj.MyHUDMovie, hud.HUDMovie):
+    if obj.bScopeCrosshair or obj.bDualWieldCrosshair or not _same(obj.MyHUDMovie, hud.HUDMovie):
         return
 
-    _crosshair_resync_missed_updates = 0
     _crosshair_resync_attempts -= 1
     truthful = _crosshair_resync_truthful_cache
     # Keep the cache truthful until the final successful post-HUD repair. This
@@ -3387,9 +4506,9 @@ def _crosshair_resync_update(obj, args, ret, func):
         pc,
         obj,
         finalize_cache=final,
-        require_ready=truthful,
     )
     if success:
+        _crosshair_resync_missed_updates = 0
         _crosshair_resync_ticks -= 1
     if _crosshair_resync_ticks <= 0 or _crosshair_resync_attempts <= 0:
         _stop_crosshair_resync()
@@ -3452,7 +4571,6 @@ def _crosshair_resync_tick(obj, args, ret, func):
         pc,
         widget,
         finalize_cache=final,
-        require_ready=truthful,
         retry_interval=0.05,
     )
     if success:
@@ -3514,6 +4632,7 @@ def _crosshair_pause_state_post(obj, args, ret, func):
     if is_open:
         _crosshair_modal_open = True
         _stop_crosshair_resync()
+        _stop_offhand_crosshair_retry()
         _release_crosshair_visibility()
         _clear_crosshair_widget()
         return
@@ -3537,6 +4656,7 @@ def _crosshair_pause_state_post(obj, args, ret, func):
             force_tick=True,
             max_attempts=720,
         )
+        _schedule_offhand_crosshair(pc)
 
 
 def _crosshair_crouch_transition(obj, args, ret, func):
@@ -3551,13 +4671,20 @@ def _crosshair_crouch_transition(obj, args, ret, func):
 
 def _crosshair_associate_post(obj, args, ret, func):
     """Reacquire a crosshair widget after native HUD/weapon reassociation."""
+    global _offhand_associated_widget
     pc = _pc()
-    if pc is None or not (_active and _cfg_crosshair and pc.bInSprintState):
+    if pc is None or not (_active and _cfg_crosshair):
         return
     hud = pc.myHUD
     if hud is None or not _same(obj.MyHUDMovie, hud.HUDMovie):
         return
-    _schedule_crosshair_resync(pc, preserve_widget=True, widget=obj)
+    if obj.bDualWieldCrosshair:
+        if _offhand_crosshair_matches(pc, obj, require_clips=False):
+            _schedule_offhand_crosshair(pc)
+            _offhand_associated_widget = unrealsdk.unreal.WeakPointer(obj)
+        return
+    if pc.bInSprintState:
+        _schedule_crosshair_resync(pc, preserve_widget=True, widget=obj)
 
 
 def _crosshair_resync_pawn(obj, args, ret, func):
@@ -3675,7 +4802,9 @@ def _sync_crosshair_hooks(pc=None):
             Type.POST_UNCONDITIONAL,
             _crosshair_tick_fallback,
         )
-        _ensure_crosshair_visible(pc)
+        if not _ensure_crosshair_visible(pc) and _crosshair_resync_ticks <= 0:
+            _schedule_crosshair_resync(pc, defer_first=True, max_attempts=240)
+        _schedule_offhand_crosshair(pc)
         return
 
     # Extremely conservative compatibility fallback for an SDK/game build where
@@ -3758,9 +4887,10 @@ def _sprint_fire_entry_tick(obj, args, ret, func):
     """Bounded sprint-entry pose probe. No steady-state animation polling."""
     global _sprint_fire_entry_remaining
     pc = _local_pc(obj)
+    if pc is None:
+        return
     if not (
-        _active and _cfg_hip_fire and _active_fire_entry
-        and pc is not None and pc.bInSprintState and _pose_fire_requested()
+        _active and _cfg_hip_fire and pc.bInSprintState and _pose_fire_requested()
         and _sprint_fire_entry_remaining > 0
     ):
         _stop_sprint_fire_entry_probe()
@@ -3773,11 +4903,11 @@ def _sprint_fire_entry_tick(obj, args, ret, func):
         _stop_sprint_fire_entry_probe()
 
 
-def _sprint_fire_entry(pc):
+def _sprint_fire_entry(pc, *, after_equip=False):
     """Event-only transition coordination; retain native BL2 arms animation."""
     global _sprint_fire_entry_remaining
     if not (
-        _active and _active_fire_entry
+        _active and (_active_fire_entry or after_equip)
         and _cfg_hip_fire and (_pose_fire_requested() or _weapons_still_firing(pc))
     ):
         return
@@ -3785,7 +4915,7 @@ def _sprint_fire_entry(pc):
     now = float(pc.WorldInfo.TimeSeconds)
     _sync_fire_hooks(True)
     _update_fire_pose(pc, firing=True, now=now)
-    if not _fire_pose.aliases_active and _active_fire_entry and _pose_fire_requested():
+    if not _fire_pose.aliases_active and _pose_fire_requested():
         _sprint_fire_entry_remaining = 6
         _set_hook("sprint-fire-entry", True, PLAYER_TICK,
                   Type.POST_UNCONDITIONAL, _sprint_fire_entry_tick)
@@ -3970,6 +5100,37 @@ def _weapon_accuracy(obj, args, ret, func):
     if not (_active and pc is not None):
         return
 
+    if pc.bInSprintState and _cfg_omni and _cfg_assist and _armed:
+        try:
+            pawn = pc.Pawn
+            physics = None if pawn is None else int(pawn.Physics)
+            if physics in (1, 2):
+                owner = _equip_sprint_owner(pc, args.TheWeapon)
+                pending = None if owner is None else _equip_sprint_handoffs.get(owner[0])
+                now = time.perf_counter()
+                if (pending is not None and pending["owner"] == owner
+                        and pending["phase"] == "bringup" and not pending["activation"]
+                        and now < pending["deadline"]
+                        and (physics == 2
+                             or (_drop_sprint_scope is not None and now < _drop_sprint_scope[1]
+                                 and owner[1:4] == _drop_sprint_scope[0][1:4])
+                             or _skill_swap_keeps_sprint(pc, pawn, args.TheWeapon))
+                        and _assist_context(pc, pawn=pawn)
+                        and (not _suppressed or (
+                            (pool := pc.AccuracyPool.Data) is not None
+                            and all(_same(refs[0](), pc) and _same(refs[2](), pool)
+                                    for refs in _suppressed)))):
+                    # The stock accuracy initializer refills the controller's
+                    # pool. During drop, BL2 can re-equip the outgoing weapon
+                    # before equipping the replacement or picking it back up.
+                    # Each bring-up still uses the same suppression context.
+                    # During a live skill a reset can also create a sprint skid.
+                    # Let it run without restarting sprint and resetting FOV.
+                    _clear_direction()
+                    return
+        except Exception:
+            pass  # Unverified equipment or pool ownership keeps the old reset.
+
     _restore_baseline()
     _clear_direction()
     if pc.bInSprintState:
@@ -3985,6 +5146,32 @@ def _weapon_accuracy(obj, args, ret, func):
             _action_skid.cancel(pc)
         _schedule_action_skid_tick()
         _sync_sprint_hooks(pc)
+
+
+def _skill_swap_keeps_sprint(pc, pawn, incoming):
+    """An equipped weapon can initialize during a live on-foot skill."""
+    # This predicate is reached only during an exact already-sprinting equip.
+    # Let a guarded summon use the same preservation path, without changing
+    # the summon guard's sprint-entry or recovery policies.
+    if not _skill_assist_context(pc, pawn=pawn, allow_guarded_swap=True):
+        return False
+    reload_active = _pose_reload_active(pawn)
+    other_reloading = False
+    if reload_active and pawn.OffHandWeapon is not None:
+        other = pawn.Weapon if _same(incoming, pawn.OffHandWeapon) else pawn.OffHandWeapon
+        def reloading(weapon):
+            return (weapon is not None and (weapon._get_address() in _pose_reload_addresses
+                    or str(weapon.GetStateName()).lower() == "weaponreloading"))
+        other_reloading = reloading(other) and not reloading(incoming)
+    return bool(
+        (not reload_active or other_reloading)
+        and _combat_sprint_safe(pc, pawn, other_weapon_reloading=other_reloading)
+        and not _crosshair_modal_open and not _travel_modal_open
+        and pc.WorldInfo.Pauser is None and pc.PlayerReplicationInfo is not None
+        and not pc.PlayerReplicationInfo.bGFxMenuOpen
+        and not (pc.bThrowingGrenade or pc.bPerformingMeleeAttack
+                 or pc.bPerformingSharedWeaponAction)
+        and not _zero_execute_waiting())
 
 
 def _movement_world_direction(pc, fwd, side, length):
@@ -4072,8 +5259,9 @@ def _force_end_sprint(pc):
 def _write_reversal_velocity(pawn, vx, vy):
     """Single guarded output boundary shared by both correction paths.
 
-    Native mode writes through the short-lived, owner-validated C++ adapter;
-    Python mode and any native write failure preserve the Stage12 behavior.
+    Native mode attempts an owner-validated C++ write. A rejected or uncertain
+    native result forbids same-frame Python fallback; only a native None
+    response permits it. Python mode writes directly.
     """
     pc = _pc()
     pi = None if pc is None else pc.PlayerInput
@@ -4130,9 +5318,9 @@ def _begin_event_reversal(pc, fwd, side, magnitude_sq, now):
         cap = float(pawn.GroundSpeed) * min(1.0, float(pawn.MaxDesiredSpeed))
     except Exception:
         return False
-    # Stage11: use the native center-crossing calculation actually reached by
-    # Responsive/Near-instant. Python still decides eligibility and writes
-    # Velocity, and remains an exact reference/fallback if native fails.
+    # Native center-crossing math is optional. Python keeps the eligibility
+    # checks and math fallback; the shared guarded output boundary chooses
+    # the native writer or a permitted Python fallback.
     native_begin = (
         _precision.center_begin(direction, (ox, oy), cap)
         if _cfg_native_precision else None
@@ -4286,10 +5474,11 @@ def _center_transition_tick(obj, args, ret, func):
 
 
 def _observe_reversal(fwd, side, magnitude_sq, preobserved=None):
-    """Native candidate-only detection with an independent Python fallback.
+    """Observe reversal candidates natively or through the Python fallback.
 
-    Python still owns the action/weapon guards, world direction and Velocity
-    writes. The native observer never keeps game-object addresses.
+    Python retains gameplay guards and decides when to request a velocity
+    correction. The selected guarded output backend performs the write.
+    The native observer never retains game-object addresses.
     """
     global _native_reversal_was_active
     if preobserved is not None or (_cfg_native_precision and _cfg_direction != VANILLA):
@@ -4401,10 +5590,10 @@ def _reversal_from_gate(fwd, side, magnitude_sq, now, preobserved=None):
     vy = float(velocity.Y)
     cap = float(pawn.GroundSpeed) * min(1.0, float(pawn.MaxDesiredSpeed))
     if _cfg_native_precision and _native_reversal_was_active:
-        # Stage10: only blend math moves native. The guard above and the
-        # guarded pawn.Velocity write below are the known-good Python path.
-        # The native adapter distinguishes a valid no-correction response
-        # from a native exception; on exception do not write stale velocity.
+        # Native mode calculates the reversal blend after Python's gameplay
+        # checks. The shared output boundary selects a guarded native write
+        # or permitted Python fallback. Failed blend evaluation cannot reuse
+        # stale velocity values.
         native_result = _precision.reversal_apply(
             unit, (vx, vy), cap, dt,
             _cfg_direction == INSTANT, _reversal.candidate,
@@ -4632,7 +5821,7 @@ def _allows(obj, args, ret, func):
     return Block, grace
 
 
-def _skill_assist_context(pc, pi=None, pawn=None):
+def _skill_assist_context(pc, pi=None, pawn=None, *, allow_guarded_swap=False):
     """Admit a live, class-declared action-skill input context for Sprint Assist.
 
     Each BL2 class uses its own selector (e.g. Scorpio, Phaselock, VisionMode,
@@ -4640,7 +5829,8 @@ def _skill_assist_context(pc, pi=None, pawn=None):
     brief casting animation even when ordinary on-foot actions are allowed.
     Only Sprint Assist's remembered input and retry paths use this exception.
     CanSprint, weapon/animation vetoes, collision and general movement gates
-    stay native/unchanged.
+    stay native/unchanged. The guarded-swap exception is exclusively for
+    preserving an existing sprint through a verified equip handoff.
     """
     if not (_cfg_assist and pc is not None):
         return False
@@ -4655,7 +5845,7 @@ def _skill_assist_context(pc, pi=None, pawn=None):
             and _same(pawn.Controller, pc)
             and pawn.DrivenVehicle is None
             and int(pawn.Physics) in (1, 2)
-            and not _deathtrap_skill_active
+            and (allow_guarded_swap or not _deathtrap_skill_active)
             and pawn.MyActionSkill is not None
             and bool(pawn.IsActionSkillRunning())
             # Reuses the existing PlayerClass.InputContexts ownership check.
@@ -4803,6 +5993,9 @@ def _start_fire(obj, args, ret, func):
             _hip_hooks_until = now + 0.20
             _sync_fire_hooks(True)
             _update_fire_pose(pc, firing=True, now=now)
+            if (not _fire_pose.aliases_active
+                    and _opposite_hand_fire_during_reload(pc, pawn)):
+                _pose_reload_end_retry()
         return
     if mode != 0:
         return
@@ -4824,6 +6017,9 @@ def _start_fire(obj, args, ret, func):
         _hip_hooks_until = now + 0.20
         _sync_fire_hooks(True)
         _update_fire_pose(pc, firing=True, now=now)
+        if (pc.Pawn is not None and not _fire_pose.aliases_active
+                and _opposite_hand_fire_during_reload(pc, pc.Pawn)):
+            _pose_reload_end_retry()
 
 
 def _stop_fire(obj, args, ret, func):
@@ -4833,6 +6029,8 @@ def _stop_fire(obj, args, ret, func):
         return
     mode = int(args.FireModeNum)
     _combat_fire_edge(pc, mode, False)
+    if _pose_reload_addresses and _fire_pose.aliases_active:
+        _update_fire_pose(pc, firing=bool(_combat_fire_mask), now=float(pc.WorldInfo.TimeSeconds))
     if mode == 1:
         was_requested = _pose_offhand_requested
         _pose_offhand_requested = False
@@ -4842,8 +6040,8 @@ def _stop_fire(obj, args, ret, func):
             _stop_sprint_fire_entry_probe()
         if _cfg_hip_fire and pc.bInSprintState:
             now = float(pc.WorldInfo.TimeSeconds)
-            _pose_release_at = now + 0.18
-            _hip_hooks_until = max(_hip_hooks_until, now + 0.18)
+            _pose_release_at = now + DUAL_FIRE_RELEASE_DELAY
+            _hip_hooks_until = max(_hip_hooks_until, _pose_release_at)
             _schedule_hip_cleanup()
         return
     if mode != 0:
@@ -4858,16 +6056,17 @@ def _stop_fire(obj, args, ret, func):
     _fire_until = now + 0.15
 
     if _cfg_hip_fire and (_hip_hooks_live or pc.bInSprintState) and not _pose_fire_requested():
-        _pose_release_at = now + 0.18
-        _hip_hooks_until = max(_hip_hooks_until, now + 0.18)
+        delay = DUAL_FIRE_RELEASE_DELAY if pc.Pawn is not None and pc.Pawn.OffHandWeapon is not None else 0.18
+        _pose_release_at = now + delay
+        _hip_hooks_until = max(_hip_hooks_until, _pose_release_at)
         _schedule_hip_cleanup()
     else:
         _pose_release_at = 0.0
 
     if _cfg_assist and _armed and not pc.bInSprintState and pc.PlayerInput is not None:
-        # Controller StopFire is only the input-release edge. Automatic guns may
-        # remain in WeaponFiring briefly after this input event, and CanSprint is
-        # intentionally still vanilla. Wait for the real state boundary.
+        # StopFire is an input-release edge, not the end of WeaponFiring.
+        # CanSprint may also be patched for sprint entry; wait for the actual
+        # weapon-state boundary rather than assuming sprint is eligible.
         if _deathtrap_skill_active:
             _schedule_deathtrap_recovery(pc)
         elif _weapons_still_firing(pc):
@@ -4973,7 +6172,15 @@ def _travel_input_frame(obj, args, ret, func):
                  bool(pc.GFxUIManager.IsBlockingMoviePlaying()))
     except Exception:
         modal = _travel_modal_open or _crosshair_modal_open
-    _travel_input.apply_pre(pi, not modal and _basic_context(pc, pi=pi))
+    # A W press from the loading screen may exist only in our established
+    # travel ledger. Changing to Gunzerking must not discard that exact press.
+    # Do not start a new keyboard injection or take over a controller here.
+    carry_key = bool(not modal and _travel_input.synthetic_kind == "keyboard"
+                     and _travel_input.pi_address == pi._get_address()
+                     and str(pi.CurrentInputContextName) == "Gunzerking"
+                     and _skill_assist_context(pc, pi=pi))
+    _travel_input.apply_pre(pi, not modal and (_basic_context(pc, pi=pi) or carry_key),
+                            keyboard_only=carry_key)
     # A key held through loading may have no native press event in the new
     # world. Keep its per-frame repair until release/native input takes over,
     # even after sprint recovery succeeds or its deadline expires.
@@ -5480,6 +6687,13 @@ def _sync_feature_hooks():
         _weapon_action_completed,
     )
     _set_optional_hook(
+        "weapon-action-pose-complete",
+        _active and _cfg_hip_fire,
+        WEAPON_ACTION_COMPLETE,
+        Type.POST_UNCONDITIONAL,
+        _weapon_action_pose_completed,
+    )
+    _set_optional_hook(
         "zero-execute-control-return",
         _active and _cfg_assist,
         ZERO_EXECUTE_CONTROLS_RESTORED,
@@ -5790,7 +7004,7 @@ def on_enable():
         )
 
     logging.info(
-        "omnimovement 1.1.17 enabled: gate=python-hook/native-optional"
+        "omnimovement 1.2.0 enabled: gate=python-hook/native-optional"
         + "; movement=event-reversal"
         + "; precision=" + str(_cfg_precision)
         + "; precision strength=" + str(int(_cfg_precision_strength * 100)) + "%"

@@ -51,7 +51,7 @@ class CombatBridgeTests(unittest.TestCase):
                        assist_ready=lambda *args, **kwargs: None,
                        intent_observe=lambda *args, **kwargs: None,
                        reset_assist=lambda kind: calls.append(('reset', kind)))
-        ns = dict(_active=True, _cfg_assist=True, _armed=True,
+        ns = dict(_active=True, _cfg_assist=True, _cfg_omni=False, _armed=True,
                   _cfg_native_precision=True, _cfg_precision=False,
                   _deathtrap_skill_active=False, _weapon_transition_addresses=set(),
                   _weapon_state_events_complete=True, _precision=precision,
@@ -160,6 +160,55 @@ class CombatBridgeTests(unittest.TestCase):
         ns['_assist_recovery_tick'](pc, None, None, None)
         self.assertIn(('try', True), calls)
         self.assertEqual(calls.count('CanSprint'), 2)
+
+    def test_omni_starts_sprint_while_swaps_continue_in_recovery(self):
+        for native in (False, True):
+            for permitted in (False, True):
+                with self.subTest(native=native, permitted=permitted):
+                    snapshot = (False, False, False, True, True, False)
+                    ns, pc, calls = self.supervisor(can_sprint=permitted)
+                    ns['_cfg_omni'] = True
+                    ns['_weapon_transition_addresses'].add(123)
+                    ns['_weapon_state_events_complete'] = False
+                    pc.Pawn.Weapon.bWeaponPutDown = True
+                    pc.Pawn.Weapon.IsEquipping = lambda: True
+                    if native:
+                        def observe(*args, retry, recovery_only, **kwargs):
+                            self.assertFalse(retry)
+                            self.assertTrue(recovery_only)
+                            return None, snapshot
+                        ns['_precision'].combat_observe = observe
+                    tick = ns['_assist_recovery_tick']
+                    tick(pc, None, None, None)
+                    ns['_weapon_transition_addresses'].add(124)
+                    tick(pc, None, None, None)
+                    self.assertEqual(calls.count('CanSprint'), 2)
+                    self.assertEqual(('try', True) in calls, permitted)
+
+    def test_swap_begin_preserves_queued_sprint_or_schedules_recovery(self):
+        ns, pc, calls = self.supervisor()
+        pi, weapon = pc.PlayerInput, pc.Pawn.Weapon
+        weapon._get_address = lambda: 123
+        ns.update(_pi_ref=lambda: pi, _pc=lambda: pc, _cfg_omni=True,
+                  _cfg_crosshair=False, _fire_requested=False,
+                  _weapon_belongs_to_local=lambda w: w is weapon,
+                  _weapon_transition_refs={}, _clear_direction=lambda: None,
+                  _schedule_assist_recovery=lambda owner: calls.append(('recover', owner)),
+                  unrealsdk=NS(unreal=NS(WeakPointer=lambda w: lambda: w)))
+        load_definitions(MOD / '__init__.py', ['_weapon_transition_begin'], ns)
+        transition = ns['_weapon_transition_begin']
+        pi.bTryToSprint = True
+        transition(weapon, None, None, None)
+        self.assertEqual(calls, [])
+        pi.bTryToSprint = False
+        transition(weapon, None, None, None)
+        self.assertEqual(calls, [('recover', pc)])
+        pc.bInSprintState = True
+        transition(weapon, None, None, None)
+        self.assertEqual(calls, [('recover', pc)])
+        ns['_armed'] = False
+        transition(weapon, None, None, None)
+        self.assertEqual(calls[-1], ('try', False))
 
     def test_stationary_pending_intent_and_confirmed_sprint_are_distinct(self):
         for status, snapshot, expected in (
